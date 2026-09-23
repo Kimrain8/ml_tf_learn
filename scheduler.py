@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-scheduler.py —— 支持实例池、异步、依赖（OR/AND 分组）、事件驱动、热重载
+scheduler.py —— 实例池 + 异步 + 依赖(OR/AND) + 事件驱动 + 续跑 + retry + 热重载
 
 用法:
-    python scheduler.py <配置文件路径>
+    python scheduler.py <配置文件路径>             正常启动
+    python scheduler.py continue <配置文件路径>   续跑（从上次失败处恢复）
 
 命令:
     update     重新加载配置文件
@@ -28,7 +29,12 @@ deps (顶层 OR，组内 AND):
     []                     无依赖
     ["a","b"]              a 成功 或 b 成功
     [["a","b"], "c"]       (a 且 b) 或 c
-    [["a","b"],["c","d"]]  (a 且 b) 或 (c 且 d)
+
+retry:
+    整数 >= 0，出错后立即重试的次数（0 表示不重试）
+
+状态文件:
+    <配置文件路径去掉扩展名>.state.json
 """
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -108,7 +115,7 @@ def add_interval(dt: datetime, spec: str) -> Optional[datetime]:
     if n < -1:
         raise ValueError(f"不支持小于 -1 的负数间隔: {spec!r}")
     if n == 0:
-        raise ValueError(f"间隔数量必须 != 0（事件驱动用 interval=0 表达）: {spec!r}")
+        raise ValueError(f"间隔数量必须 != 0: {spec!r}")
 
     if unit == "ss":
         return dt + timedelta(seconds=n)
@@ -161,7 +168,6 @@ def advance_to_after(base: datetime, interval: str, after: datetime) -> datetime
 
 
 def parse_start_at(s) -> datetime:
-    """None/"" -> now, 数字 -> now + N 秒, 'HH:MM[:SS]' -> 今天/明天该时刻, ISO -> 绝对时间"""
     now = datetime.now()
     if s is None or s == "":
         return now
@@ -186,9 +192,6 @@ def parse_start_at(s) -> datetime:
 
 
 def _normalize_interval(raw) -> Optional[str]:
-    """
-    统一为：None（只跑一次）/ EVENT（事件驱动）/ "ss_5" 等（时间间隔）
-    """
     if raw is None:
         return None
     if isinstance(raw, bool):
@@ -203,16 +206,11 @@ def _normalize_interval(raw) -> Optional[str]:
         return None
     if s == "0":
         return EVENT
-    add_interval(datetime.now(), s)   # 格式校验
+    add_interval(datetime.now(), s)
     return s
 
 
 def _parse_deps(raw) -> List[List[str]]:
-    """
-    统一为 List[List[str]]：外层 OR，内层 AND。
-    ["a","b"] -> [["a"],["b"]]
-    [["a","b"],"c"] -> [["a","b"],["c"]]
-    """
     if not raw:
         return []
     groups: List[List[str]] = []
@@ -351,11 +349,12 @@ class Task:
     name: str
     func_spec: str
     interval: Optional[str]            # None=仅一次, EVENT=事件驱动, "ss_5"...
-    next_run: Optional[datetime]       # EVENT 或已完成的 once 为 None
+    next_run: Optional[datetime]
     params: Dict[str, Any] = field(default_factory=dict)
-    deps_groups: List[List[str]] = field(default_factory=list)  # OR of AND
+    deps_groups: List[List[str]] = field(default_factory=list)
     validate: int = 1
     timeout: Optional[float] = None
+    retry: int = 0                     # 出错后立即重试次数
     start_at_raw: Any = None
 
     last_status: str = "pending"       # pending / ok / failed / skipped
@@ -365,6 +364,7 @@ class Task:
     fail_count: int = 0
     running: bool = False
     pending_remove: bool = False
+    retries_done: int = 0              # 本次调度已重试次数（运行时）
 
     @property
     def is_event(self) -> bool:
@@ -386,7 +386,9 @@ class Scheduler:
         self._thread: Optional[threading.Thread] = None
         self._stop = False
         self._config_path: Optional[str] = None
+        self._state_file: Optional[str] = None
         self._reload_flag = False
+        self._state: Dict[str, dict] = {}
 
         self._instances = InstancePool()
 
@@ -395,16 +397,101 @@ class Scheduler:
         self._async_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
-    # 配置加载 / 热重载
+    # 配置加载
     # ------------------------------------------------------------------ #
-    def load_config(self, path: str) -> None:
+    def load_config(self, path: str, continue_mode: bool = False) -> None:
         self._config_path = path
+        base, _ = os.path.splitext(path)
+        self._state_file = base + ".state.json"
+
+        if continue_mode:
+            self._load_state()
+
         self._reload_config()
+
+        if continue_mode:
+            self._apply_state_to_tasks()
 
     def request_reload(self) -> None:
         with self._cv:
             self._reload_flag = True
             self._cv.notify_all()
+
+    def _load_state(self) -> None:
+        if not self._state_file or not os.path.exists(self._state_file):
+            log.info("续跑模式：未找到状态文件 %s，将按正常流程启动", self._state_file)
+            return
+        try:
+            with open(self._state_file, encoding="utf-8") as f:
+                data = json.load(f)
+            self._state = data.get("tasks", {})
+            log.info("续跑模式：已读取状态文件 %s（%d 个任务记录，保存于 %s）",
+                     self._state_file, len(self._state), data.get("saved_at"))
+        except Exception:
+            log.exception("读取状态文件失败")
+
+    def _apply_state_to_tasks(self) -> None:
+        """把状态文件里的 last_status 应用到任务；失败/跳过的立即重跑"""
+        if not self._state:
+            return
+        now = datetime.now()
+        actions: List[str] = []
+        for name, t in self._tasks.items():
+            st = self._state.get(name)
+            if not st:
+                continue
+            prev = st.get("last_status", "pending")
+            t.last_status = prev
+            t.run_count = st.get("run_count", 0)
+            t.fail_count = st.get("fail_count", 0)
+            t.last_error = st.get("last_error")
+            lr = st.get("last_run")
+            if lr:
+                try:
+                    t.last_run = datetime.fromisoformat(lr)
+                except Exception:
+                    pass
+
+            if prev == "failed":
+                # 失败任务：立即重跑（事件驱动任务靠依赖触发，无需改 next_run）
+                if not t.is_event:
+                    t.next_run = now
+                t.last_status = "pending"    # 视为待跑
+                actions.append(f"{name}(failed→立即重跑)")
+            elif prev == "skipped":
+                if not t.is_event and (t.next_run is None or t.next_run > now):
+                    t.next_run = now
+                t.last_status = "pending"
+                actions.append(f"{name}(skipped→等待依赖恢复)")
+
+        if actions:
+            log.info("续跑模式：%d 个任务被重新激活：%s", len(actions), "; ".join(actions))
+        else:
+            log.info("续跑模式：无失败/跳过任务，按原计划运行")
+
+    def _save_state(self) -> None:
+        if not self._state_file:
+            return
+        with self._cv:
+            snapshot = {
+                name: {
+                    "last_status": t.last_status,
+                    "last_run": t.last_run.isoformat() if t.last_run else None,
+                    "last_error": t.last_error,
+                    "run_count": t.run_count,
+                    "fail_count": t.fail_count,
+                }
+                for name, t in self._tasks.items()
+            }
+        try:
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"tasks": snapshot, "saved_at": datetime.now().isoformat()},
+                    f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._state_file)
+        except Exception:
+            log.exception("保存状态失败")
 
     def _reload_config(self) -> None:
         if not self._config_path:
@@ -418,16 +505,16 @@ class Scheduler:
 
         # ---- instances ----
         new_specs: Dict[str, InstanceSpec] = {}
-        for name, spec in cfg.get("instances", {}).items():
+        for iname, spec in cfg.get("instances", {}).items():
             try:
-                new_specs[name] = InstanceSpec(
-                    name=name,
+                new_specs[iname] = InstanceSpec(
+                    name=iname,
                     class_path=spec["class"],
                     args=dict(spec.get("args", {})),
                     lifetime=spec.get("lifetime", "call"),
                 )
             except Exception:
-                log.exception("解析实例 [%s] 失败", name)
+                log.exception("解析实例 [%s] 失败", iname)
         self._instances.update_specs(new_specs)
 
         # ---- tasks ----
@@ -452,10 +539,9 @@ class Scheduler:
                     try:
                         self._tasks[name] = self._build_task(spec)
                         t = self._tasks[name]
-                        nr = t.next_run.strftime("%Y-%m-%d %H:%M:%S") if t.next_run else "事件驱动/仅一次"
-                        log.info("[%s] 新增 validate=%s interval=%s next=%s deps=%s",
-                                 name, t.validate, t.interval or "(仅一次)", nr,
-                                 t.deps_groups or "-")
+                        nr = t.next_run.strftime("%Y-%m-%d %H:%M:%S") if t.next_run else "无"
+                        log.info("[%s] 新增 validate=%s interval=%s retry=%d next=%s",
+                                 name, t.validate, t.interval or "(仅一次)", t.retry, nr)
                     except Exception:
                         log.exception("[%s] 创建失败", name)
 
@@ -470,13 +556,16 @@ class Scheduler:
         interval = _normalize_interval(spec.get("interval"))
         deps_groups = _parse_deps(spec.get("deps", []))
         start_raw = spec.get("start_at")
+        retry = int(spec.get("retry", 0))
+        if retry < 0:
+            raise ValueError(f"[{name}] retry 必须 >= 0")
 
         if interval == EVENT:
-            next_run = None                       # 事件驱动，不参与时间调度
+            next_run = None
             if not deps_groups:
                 log.warning("[%s] interval=0（事件驱动）但未声明 deps，永远不会触发", name)
         elif interval is None:
-            next_run = parse_start_at(start_raw)  # 只跑一次，等 start_at 到
+            next_run = parse_start_at(start_raw)
         else:
             start = parse_start_at(start_raw)
             next_run = advance_to_after(start, interval, datetime.now())
@@ -490,11 +579,12 @@ class Scheduler:
             deps_groups=deps_groups,
             validate=int(spec.get("validate", 1)),
             timeout=spec.get("timeout"),
+            retry=retry,
             start_at_raw=start_raw,
         )
 
     def _update_task(self, t: Task, spec: Dict[str, Any]) -> None:
-        note = "（任务正在运行，本次不打断）" if t.running else ""
+        note = "（运行中）" if t.running else ""
 
         new_func_spec = spec["func"]
         if new_func_spec != t.func_spec:
@@ -518,6 +608,13 @@ class Scheduler:
             log.info("[%s] validate 更新为 %s %s", t.name, new_validate, note)
 
         t.timeout = spec.get("timeout")
+
+        new_retry = int(spec.get("retry", 0))
+        if new_retry < 0:
+            raise ValueError(f"[{t.name}] retry 必须 >= 0")
+        if new_retry != t.retry:
+            t.retry = new_retry
+            log.info("[%s] retry 更新为 %d %s", t.name, new_retry, note)
 
         new_interval = _normalize_interval(spec.get("interval"))
         interval_changed = new_interval != t.interval
@@ -547,7 +644,7 @@ class Scheduler:
                 t.next_run = advance_to_after(t.next_run, t.interval, datetime.now())
 
     # ------------------------------------------------------------------ #
-    # 动态参数维护
+    # 动态参数
     # ------------------------------------------------------------------ #
     def update_params(self, name: str, **kwargs) -> None:
         with self._cv:
@@ -624,23 +721,18 @@ class Scheduler:
             self._thread.join(timeout)
         self._stop_async_loop()
         self._instances.shutdown()
+        try:
+            self._save_state()
+        except Exception:
+            log.exception("退出时保存状态失败")
         log.info("调度器已停止")
 
     # ------------------------------------------------------------------ #
     # 依赖检查
     # ------------------------------------------------------------------ #
     def _deps_blocked_reason(self, task: Task) -> Optional[str]:
-        """
-        返回 None 表示依赖满足（可以执行）。
-        返回字符串表示被阻塞的原因。
-        规则：
-          - 外层 OR：任一 AND 组满足即可
-          - AND 组内：所有依赖都必须 last_status == "ok" 且不在 running
-          - 依赖不存在 / 无效 / pending / failed / skipped / running 都视为不满足
-        """
         if not task.deps_groups:
             return None
-
         reasons: List[str] = []
         for group in task.deps_groups:
             group_ok = True
@@ -648,28 +740,20 @@ class Scheduler:
             for dep_name in group:
                 dep = self._tasks.get(dep_name)
                 if dep is None:
-                    group_ok = False
-                    group_why.append(f"{dep_name}(未注册)")
-                    break
+                    group_ok = False; group_why.append(f"{dep_name}(未注册)"); break
                 if not dep.validate:
-                    group_ok = False
-                    group_why.append(f"{dep_name}(已禁用)")
-                    break
+                    group_ok = False; group_why.append(f"{dep_name}(已禁用)"); break
                 if dep.running:
-                    group_ok = False
-                    group_why.append(f"{dep_name}(运行中)")
-                    break
+                    group_ok = False; group_why.append(f"{dep_name}(运行中)"); break
                 if dep.last_status != "ok":
-                    group_ok = False
-                    group_why.append(f"{dep_name}({dep.last_status})")
-                    break
+                    group_ok = False; group_why.append(f"{dep_name}({dep.last_status})"); break
             if group_ok:
                 return None
             reasons.append("(" + "+".join(group_why) + ")")
         return " or ".join(reasons)
 
     # ------------------------------------------------------------------ #
-    # 拓扑排序：保证同批内被依赖者先执行
+    # 拓扑排序
     # ------------------------------------------------------------------ #
     def _topo_sort(self, tasks: List[Task]) -> List[Task]:
         by_name = {t.name: t for t in tasks}
@@ -703,7 +787,6 @@ class Scheduler:
     def _loop(self):
         log.info("调度线程启动")
         while True:
-            # ---- 重载 ----
             do_reload = False
             with self._cv:
                 if self._stop:
@@ -717,7 +800,6 @@ class Scheduler:
                 except Exception:
                     log.exception("重载配置失败")
 
-            # ---- 找时间到期的任务（不含事件驱动）----
             with self._cv:
                 if self._stop:
                     break
@@ -738,33 +820,45 @@ class Scheduler:
 
                 if not due:
                     if earliest is None:
-                        self._cv.wait(timeout=1.0)
+                        # 无任务或全部事件驱动：无限等待，被 notify 唤醒
+                        self._cv.wait()
                     else:
                         timeout = max(0.05, (earliest - now).total_seconds())
-                        self._cv.wait(timeout=min(timeout, 1.0))
+                        self._cv.wait(timeout=timeout)
                     continue
                 due.sort(key=lambda x: x.next_run)
 
-            # ---- 执行批次 ----
-            self._run_batch(due)
+            try:
+                self._run_batch(due)
+            except Exception:
+                log.exception("批次执行出错")
 
         log.info("调度线程退出")
 
     def _run_batch(self, due: List[Task]) -> None:
         ordered = self._topo_sort(due)
         queue: List[Task] = list(ordered)
-        executed: set = set()
+        finished: set = set()      # ok / failed
+        skipped: set = set()       # skipped（本批次内避免重复激活）
         batch_ctx: Dict[str, Any] = {}
+        max_iter = len(due) * 10 + 50
+        it = 0
 
         try:
             while queue:
+                it += 1
+                if it > max_iter:
+                    log.warning("批次迭代超限 (%d)，剩余任务: %s",
+                                max_iter, [t.name for t in queue])
+                    break
+
                 task = queue.pop(0)
-                if task.name in executed:
+                if task.name in finished:
                     continue
                 with self._cv:
                     if not task.validate or task.running or task.pending_remove:
                         continue
-                executed.add(task.name)
+
                 self._run_task(task, batch_ctx)
 
                 if task.pending_remove:
@@ -773,23 +867,55 @@ class Scheduler:
                     log.info("[%s] 已运行完毕，按配置删除", task.name)
                     continue
 
-                # 事件驱动触发：只有成功才触发下游
+                # 需要重试：立即重新入队（插到队首）
+                if task.last_status == "retrying":
+                    queue.insert(0, task)
+                    continue
+
                 if task.last_status == "ok":
-                    for t in list(self._tasks.values()):
-                        if not t.is_event:
-                            continue
-                        if t.name in executed:
-                            continue
-                        if not t.validate or t.running or t.pending_remove:
-                            continue
-                        if self._deps_blocked_reason(t) is None:
-                            queue.append(t)
-                            log.info("[%s] 依赖满足，事件驱动触发", t.name)
+                    finished.add(task.name)
+                    self._activate_downstream(task, queue, finished, skipped)
+                elif task.last_status == "failed":
+                    finished.add(task.name)
+                elif task.last_status == "skipped":
+                    skipped.add(task.name)
         finally:
             try:
                 self._instances.release_batch(batch_ctx)
             except Exception:
                 log.exception("释放 batch 实例失败")
+
+    def _activate_downstream(self, upstream: Task, queue: List[Task],
+                             finished: set, skipped: set) -> None:
+        """上游成功后，重新激活之前被跳过的下游任务（如果依赖现在满足）"""
+        now = datetime.now()
+        in_queue = {q.name for q in queue}
+        for t in list(self._tasks.values()):
+            if t.name == upstream.name:
+                continue
+            if t.name in finished or t.name in in_queue or t.name in skipped:
+                continue
+            if not t.validate or t.running or t.pending_remove:
+                continue
+            is_down = any(upstream.name in group for group in t.deps_groups)
+            if not is_down:
+                continue
+            if self._deps_blocked_reason(t) is None:
+                t.next_run = now
+                queue.append(t)
+                log.info("[%s] 上游 [%s] 成功，激活下游", t.name, upstream.name)
+
+        # 事件驱动任务
+        for t in list(self._tasks.values()):
+            if not t.is_event:
+                continue
+            if t.name in finished or t.name in in_queue:
+                continue
+            if not t.validate or t.running or t.pending_remove:
+                continue
+            if self._deps_blocked_reason(t) is None:
+                queue.append(t)
+                log.info("[%s] 事件驱动：依赖满足，触发", t.name)
 
     # ------------------------------------------------------------------ #
     # 函数解析
@@ -813,42 +939,72 @@ class Scheduler:
         return fn, None
 
     # ------------------------------------------------------------------ #
-    # 执行
+    # 执行单个任务（含 retry 逻辑）
     # ------------------------------------------------------------------ #
     def _run_task(self, task: Task, batch_ctx: Dict[str, Any]) -> None:
         scheduled_time = task.next_run
         task.running = True
         task.last_run = datetime.now()
         cleanup = None
+        final = False
 
         try:
             blocked = self._deps_blocked_reason(task)
             if blocked:
                 task.last_status = "skipped"
                 log.warning("[%s] 跳过执行，依赖未满足: %s", task.name, blocked)
-            else:
-                try:
-                    func, cleanup = self._resolve_task_func(task, batch_ctx)
-                except Exception as e:
+                final = True
+                return
+
+            # 解析函数
+            try:
+                func, cleanup = self._resolve_task_func(task, batch_ctx)
+            except Exception as e:
+                task.last_error = repr(e)
+                log.exception("[%s] 解析 func 失败: %s", task.name, task.func_spec)
+                if task.retries_done < task.retry:
+                    task.retries_done += 1
+                    task.last_status = "retrying"
+                    log.warning("[%s] 解析失败，立即重试 (%d/%d)",
+                                task.name, task.retries_done, task.retry)
+                else:
                     task.last_status = "failed"
                     task.fail_count += 1
-                    task.last_error = repr(e)
-                    log.exception("[%s] 解析 func 失败: %s", task.name, task.func_spec)
+                    task.retries_done = 0
+                    final = True
+                return
+
+            attempt = task.retries_done + 1
+            total = task.retry + 1
+            log.info("[%s] 开始执行 func=%s params=%s (第 %d/%d 次)",
+                     task.name, task.func_spec, task.params, attempt, total)
+
+            try:
+                self._execute(task, func)
+            except Exception as e:
+                task.last_error = repr(e)
+                log.exception("[%s] 执行失败", task.name)
+                if task.retries_done < task.retry:
+                    task.retries_done += 1
+                    task.last_status = "retrying"
+                    log.warning("[%s] 立即重试 (%d/%d)",
+                                task.name, task.retries_done, task.retry)
                 else:
-                    log.info("[%s] 开始执行 func=%s params=%s",
-                             task.name, task.func_spec, task.params)
-                    try:
-                        self._execute(task, func)
-                    except Exception as e:
-                        task.last_status = "failed"
-                        task.fail_count += 1
-                        task.last_error = repr(e)
-                        log.exception("[%s] 执行失败", task.name)
-                    else:
-                        task.last_status = "ok"
-                        task.run_count += 1
-                        task.last_error = None
-                        log.info("[%s] 执行成功", task.name)
+                    task.last_status = "failed"
+                    task.fail_count += 1
+                    task.retries_done = 0
+                    final = True
+                    if task.retry > 0:
+                        log.error("[%s] 重试 %d 次后仍失败", task.name, task.retry)
+            else:
+                task.last_status = "ok"
+                task.run_count += 1
+                task.last_error = None
+                if task.retries_done > 0:
+                    log.info("[%s] 第 %d 次重试成功", task.name, task.retries_done)
+                task.retries_done = 0
+                final = True
+                log.info("[%s] 执行成功", task.name)
         finally:
             if cleanup is not None:
                 inst, iname = cleanup
@@ -858,14 +1014,18 @@ class Scheduler:
                     log.exception("关闭 call 实例 [%s] 失败", iname)
 
             task.running = False
-            # next_run 推进
-            if task.interval == EVENT:
-                task.next_run = None
-            elif task.interval is None:
-                task.next_run = None           # 只跑一次
-            else:
-                now = datetime.now()
-                task.next_run = advance_to_after(scheduled_time, task.interval, now)
+
+            # 只有 final 状态才推进 next_run 并持久化
+            if final:
+                if task.interval == EVENT:
+                    task.next_run = None
+                elif task.interval is None:
+                    task.next_run = None
+                else:
+                    now = datetime.now()
+                    task.next_run = advance_to_after(scheduled_time, task.interval, now)
+                self._save_state()
+
             with self._cv:
                 self._cv.notify_all()
 
@@ -897,6 +1057,7 @@ class Scheduler:
                     "func": t.func_spec,
                     "interval": (t.interval if t.interval else
                                  ("事件驱动" if t.interval == EVENT else "(仅一次)")),
+                    "retry": t.retry,
                     "next_run": (t.next_run.strftime("%Y-%m-%d %H:%M:%S")
                                  if t.next_run else "无"),
                     "in_seconds": (round((t.next_run - now).total_seconds(), 1)
@@ -921,16 +1082,28 @@ def sch_main():
 
     if len(sys.argv) < 2:
         print("用法: python scheduler.py <配置文件路径>")
+        print("      python scheduler.py continue <配置文件路径>   # 从上次失败处续跑")
         sys.exit(1)
 
-    config_path = sys.argv[1]
+    args = sys.argv[1:]
+    continue_mode = False
+    config_path = None
+    if args[0] == "continue":
+        continue_mode = True
+        if len(args) < 2:
+            print("用法: python scheduler.py continue <配置文件路径>")
+            sys.exit(1)
+        config_path = args[1]
+    else:
+        config_path = args[0]
+
     setup_logging()
 
     sch = Scheduler()
     _GLOBAL_SCHEDULER = sch
 
     try:
-        sch.load_config(config_path)
+        sch.load_config(config_path, continue_mode=continue_mode)
     except Exception:
         log.exception("首次加载配置失败")
         sys.exit(1)
@@ -940,6 +1113,10 @@ def sch_main():
     print()
     print("=" * 60)
     print(f"调度器已启动 | 配置文件: {config_path}")
+    if continue_mode:
+        print("模式: 续跑（从上次失败/跳过处恢复）")
+    else:
+        print("模式: 正常")
     print("命令:")
     print("  update     重新加载配置文件")
     print("  cancel all 取消所有任务和调度计划并退出")
