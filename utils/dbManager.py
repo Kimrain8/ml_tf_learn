@@ -11,34 +11,44 @@ from pathlib import Path
 from utils.JSONConfig import ConfigHandler
 
 class MySQLHelper:
-    _instance = None  # 单例模式
+    # 【改动】不再是单个实例，而是实例缓存池：key=db名称，value=MySQLHelper实例
+    _instance_pool = {}
+
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super(MySQLHelper, cls).__new__(cls)
-        return cls._instance
-    
+        """
+        改造单例：按db名称隔离实例
+        使用方式不变：db = MySQLHelper(db='jhd')
+        同一个db多次调用，返回同一个连接池实例；不同db返回各自独立实例
+        """
+        # 获取传入的db参数，默认ginger2
+        db_name = kwargs.get("db", "ginger2")
+        if db_name not in cls._instance_pool:
+            # 不存在，则新建实例放入池
+            new_obj = super().__new__(cls)
+            cls._instance_pool[db_name] = new_obj
+        return cls._instance_pool[db_name]
+
     def __init__(self, config_path=r'D:\pyprj\cv2\utils\config.json', db='ginger2'):
         self.config_path = config_path
-        # 避免重复初始化
-        if getattr(self, 'db', None) != db:
-            self.db = db
-            cfghandle = ConfigHandler(self.config_path)
-            cfg = cfghandle.config_data[self.db]
-            cfg['password'] = cfghandle.get_decrypt((self.db, 'password'))
-            self.host = cfg['host']
-            self.port = cfg['port']
-            self.user = cfg['username']
-            self.password = cfg['password']
-            self.database = cfg['dbname']
-            self.max_connections = cfg['maxconnection']
-            self.connections = Queue(maxsize=self.max_connections)
-            self._initialize_connections()
-    
-    # def _initialize_connections(self):
-    #     # 初始化3个连接（不超过最大连接数）
-    #     init_count = min(3, self.max_connections)
-    #     for _ in range(init_count):
-    #         self._create_connection()
+        self.db = db
+        # 标记是否已经初始化过，防止重复初始化（关键）
+        if hasattr(self, "_initialized") and self._initialized:
+            return
+
+        # 首次初始化才加载配置、创建连接队列
+        cfghandle = ConfigHandler(self.config_path)
+        cfg = cfghandle.config_data[self.db]
+        cfg['password'] = cfghandle.get_decrypt((self.db, 'password'))
+        self.host = cfg['host']
+        self.port = cfg['port']
+        self.user = cfg['username']
+        self.password = cfg['password']
+        self.database = cfg['dbname']
+        self.max_connections = cfg['maxconnection']
+        self.connections = Queue(maxsize=self.max_connections)
+        self._initialize_connections()
+        # 设置初始化标记，后续__init__直接跳过
+        self._initialized = True
 
     def _initialize_connections(self):
         init_count = min(3, self.max_connections)
@@ -66,16 +76,13 @@ class MySQLHelper:
                     autocommit=False  # 保持显式事务控制，但确保在连接管理器中处理
                 )
                 return connection
-
             except Error as err:
                 print(f"[创建连接失败 第{i+1}/{attempts}次] 原因: {err}")
                 if i + 1 >= attempts:
                     print(f"❌ 已达到最大重试次数 {attempts}，放弃创建连接")
                     return None
-
         return None
 
-    
     def _get_connection(self):
         try:
             # 从队列拿连接
@@ -99,7 +106,6 @@ class MySQLHelper:
             else:
                 raise Exception("❌ 连接池耗尽，且无法创建新连接（已达最大重试次数）")
 
-    
     def _release_connection(self, connection):
         """ 释放连接回队列 """
         if connection.is_connected():
@@ -109,17 +115,16 @@ class MySQLHelper:
                     connection.rollback()  # 未提交的事务统一回滚，避免锁遗留
             except Exception as e:
                 print(f"Warning: Failed to rollback on release: {e}")
-                
+
             if self.connections.qsize() < self.max_connections:
                 self.connections.put(connection)
             else:
                 connection.close()
                 print("关闭多余连接")
         else:
-            # 连接失效则重建
-            # self._create_connection()
+            # 连接失效则丢弃
             print("Connection is dead, skip recreating in release")
-    
+
     @contextmanager
     def connection_manager(self):
         connection = self._get_connection()
@@ -136,13 +141,11 @@ class MySQLHelper:
             raise
         finally:
             self._release_connection(connection)
-    
+
     def close_all(self):
-        """ 关闭所有连接 """
+        """ 关闭当前db实例下所有连接 """
         temp_connections = []
         while not self.connections.empty():
-            # connection = self.connections.get()
-            # connection.close()
             try:
                 connection = self.connections.get_nowait()
                 if connection.is_connected():
@@ -155,8 +158,16 @@ class MySQLHelper:
                 temp_connections.append(connection)
             except Empty:
                 break
-        print("所有连接已关闭")
-    
+        print(f"[{self.db}] 所有连接已关闭")
+
+    @classmethod
+    def close_all_pool(cls):
+        """【新增类方法】关闭全部db池所有连接，程序退出时调用清理资源"""
+        for db_name, helper in cls._instance_pool.items():
+            helper.close_all()
+        cls._instance_pool.clear()
+        print("✅ 全部数据库连接池已清空")
+
     def insert_single(self, table, data):
         """
         table：对应数据库的表名
@@ -176,16 +187,16 @@ class MySQLHelper:
             except Exception as e:
                 if connection:
                     connection.rollback()
-                print(f"❌ 批量插入失败，已回滚。错误信息: {str(e)}")
+                print(f"❌ 单条插入失败，已回滚。错误信息: {str(e)}")
                 raise
             finally:
                 # 无论成功失败，确保关闭cursor
                 if cursor:
                     cursor.close()
-    
+
     def bulkInsert(self, table, df):
         """ 批量插入DataFrame """
-        
+
         with self.connection_manager() as connection:
             cursor = None
             try:
@@ -197,7 +208,6 @@ class MySQLHelper:
                 cursor.executemany(sql, data)
                 connection.commit()
                 print(f"✅ 批量插入成功，共{len(data)}条")
-                # cursor.close()
             except Exception as e:
                 if connection:
                     connection.rollback()
@@ -207,6 +217,7 @@ class MySQLHelper:
                 # 无论成功失败，确保关闭cursor
                 if cursor:
                     cursor.close()
+
     def bulkInsUpd(self, df, table):
         """
         插入或更新（有唯一索引冲突就更新，无冲突就插入）
@@ -221,20 +232,20 @@ class MySQLHelper:
         columns = list(df.columns)
         col_str = ", ".join(columns)
         placeholders = ", ".join(["%s"] * len(columns))
-    
+
         # 生成 ON DUPLICATE KEY UPDATE 子句
         update_clause = ", ".join([f"{col} = VALUES({col})" for col in columns])
-    
+
         # 最终SQL（MySQL 专用，高性能）
         sql = f"""
             INSERT INTO {table} ({col_str})
             VALUES ({placeholders})
             ON DUPLICATE KEY UPDATE {update_clause}
         """
-    
+
         # 批量参数
         params = df.to_numpy().tolist()
-    
+
         # 执行
         with self.connection_manager() as conn:
             cursor = conn.cursor()
@@ -243,24 +254,23 @@ class MySQLHelper:
             affected = cursor.rowcount
             cursor.close()
             print(f"✅ insert_or_update 执行完成 | 影响行数：{affected} | 总数据：{len(df)}")
-            
+
     def query(self, sql, dct=True):
         """ 执行查询，返回列表（字典/元组格式）"""
         with self.connection_manager() as connection:
+            cursor = None
             try:
                 cursor = connection.cursor(dictionary=dct)
                 cursor.execute(sql)
                 result = cursor.fetchall()
-                cursor.close()
                 return result
             except Exception as e:
-                print(f"❌ 批量插入失败，已回滚。错误信息: {str(e)}")
+                print(f"❌ 查询失败，错误信息: {str(e)}")
                 raise
             finally:
-                # 无论成功失败，确保关闭cursor
                 if cursor:
                     cursor.close()
-    
+
     def query2df(self, sql):
         """ 查询并返回DataFrame（用pandas内置方法）"""
         with self.connection_manager() as connection:
@@ -270,16 +280,16 @@ class MySQLHelper:
             except Exception as e:
                 print(f"❌ 数据读取失败。错误信息: {str(e)}")
                 raise
-    
+
     def qry2df(self, sql):
         """ 手动查询并返回DataFrame（兼容低版本pandas）"""
         with self.connection_manager() as connection:
+            cursor = None
             try:
                 cursor = connection.cursor()
                 cursor.execute(sql)
                 columns = [desc[0] for desc in cursor.description]
                 data = cursor.fetchall()
-                cursor.close()
                 # 修复：Dataframe改为DataFrame
                 df = pd.DataFrame(data, columns=columns)
                 return df
@@ -287,10 +297,9 @@ class MySQLHelper:
                 print(f"❌ 数据读取失败。错误信息: {str(e)}")
                 raise
             finally:
-                # 无论成功失败，确保关闭cursor
                 if cursor:
                     cursor.close()
-    
+
     def bulk_update(self, table, df, key):
         """
         批量一条条更新DataFrame数据
@@ -301,30 +310,30 @@ class MySQLHelper:
         with self.connection_manager() as connection:
             cursor = connection.cursor()
             update_count = 0
-    
+
             # 统一转成列表格式（兼容单列/多列）
             if isinstance(key, str):
                 key_columns = [key]
             else:
                 key_columns = list(key)
-    
+
             for index, row in df.iterrows():
                 # ================== 生成 SET 子句（排除主键）==================
                 set_columns = [col for col in df.columns if col not in key_columns]
                 set_clause = ','.join([f"{col} = %s" for col in set_columns])
-    
+
                 # ================== 生成 WHERE 子句（多列用 AND 连接）==================
                 where_clause = ' AND '.join([f"{k} = %s" for k in key_columns])
-    
+
                 # ================== 拼接最终 SQL ==================
                 sql = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
-    
+
                 # ================== 参数顺序：先赋值列，再主键列 ==================
                 values = [row[col] for col in set_columns] + [row[col] for col in key_columns]
-    
+
                 cursor.execute(sql, values)
                 update_count += 1
-    
+
             connection.commit()
             print(f"批量更新成功，共 {update_count} 条")
             cursor.close()
@@ -340,22 +349,22 @@ class MySQLHelper:
             key_cols = [key]
         else:
             key_cols = list(key)
-    
+
         # 要更新的字段（排除主键）
         update_cols = [col for col in df.columns if col not in key_cols]
         if not update_cols:
             print("没有需要更新的字段")
             return
-    
+
         # 拼接 SQL
         set_clause = ", ".join([f"{col} = %s" for col in update_cols])
         where_clause = " AND ".join([f"{col} = %s" for col in key_cols])
         sql = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
-    
+
         # 构造参数列表：[更新字段...] + [主键字段...]
         param_order = update_cols + key_cols
         params = df[param_order].to_numpy().tolist()  # 超快
-    
+
         # executemany 批量执行（核心：只发一次请求到 MySQL）
         with self.connection_manager() as conn:
             cursor = conn.cursor()
@@ -365,7 +374,6 @@ class MySQLHelper:
             cursor.close()
             print(f"✅ 批量更新完成 | 影响行数：{rowcount} | 总条数：{len(df)}")
 
-    
     def delete(self, table, condition):
         """ 删除数据（注意condition需自行确保安全，避免SQL注入）"""
         with self.connection_manager() as connection:
@@ -385,15 +393,11 @@ class MySQLHelper:
         if df.empty:
             print("✅ DataFrame 为空，无需删除")
             return
-
         # 拼接 WHERE 条件：列1=%s AND 列2=%s AND ...
         where_conditions = " AND ".join([f"{col} = %s" for col in df.columns])
         sql = f"DELETE FROM {table} WHERE {where_conditions}"
-
         # 转换为参数列表（批量执行格式）
         params = df.to_numpy().tolist()
-
-        # 执行批量删除
         with self.connection_manager() as conn:
             cursor = conn.cursor()
             try:
@@ -406,7 +410,7 @@ class MySQLHelper:
                 raise
             finally:
                 cursor.close()
-    
+
     def truncate(self, table):
         # 清空表（慎用，不可恢复）
         self.close_all()
@@ -433,14 +437,15 @@ class MySQLHelper:
         colmap.index = cols['COLUMN_NAME']
         return df.columns.map(colmap)
 
-
-        
-        
-
 # -------------------------- 主程序测试代码（仅直接运行时执行） --------------------------
 if __name__ == "__main__":
-    # 初始化助手
-    db = MySQLHelper()
+    # 测试：两个不同db，各自独立连接池
+    db_jhd = MySQLHelper(db='jhd')
+    db_ginger = MySQLHelper(db='ginger2')
+
+    # 同一个db多次实例化，拿到同一个对象
+    db_jhd2 = MySQLHelper(db='jhd')
+    print(f"db_jhd is db_jhd2 ? {db_jhd is db_jhd2}") # True
     
     # 测试单条插入
     data = {'id': 9001, '1v5': '测试1'}
