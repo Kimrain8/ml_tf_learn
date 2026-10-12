@@ -311,43 +311,72 @@ class MySQLHelper:
                     cursor.close()
         return affected
 
-    def bulkInsUpd(self, df, table):
+    def bulkInsUpd(self, df, table, sql_exprs=None):
         """
         插入或更新（有唯一索引冲突就更新，无冲突就插入）
         依赖：表必须设置 主键 / 唯一索引
-        性能：executemany 批量执行，比循环快100倍
+
+        :param df:         DataFrame，列名=表字段，JSON 字段可传 dict/list（自动序列化）
+        :param table:      表名
+        :param sql_exprs:  可选。dict {列名: SQL表达式}，命中列用表达式更新，未命中列仍走 VALUES(col)。表达式里可用：
+                             - VALUES(col) → 本行"本应插入"的新值
+                             - col         → 表里当前旧值
+                           ⚠️ 表达式必须是代码常量或白名单校验后的标识符，绝不能拼接用户输入（裸 SQL）。
         """
         if df.empty:
             print("✅ DataFrame 为空，无需操作")
             return
+
         df = df.replace({np.nan: None})
-        df = self._serialize_df(df)
-        # 列和占位符
+
+        # ============ 显式判断：df 中是否包含 JSON 字段 ============
+        # 命中才序列化，未命中一帧都不动（省掉一次 df.copy()）
+        if self.jsfields:
+            hit_json_cols = [c for c in df.columns if c in self.jsfields]
+            if hit_json_cols:
+                df = self._serialize_df(df)     # 只有命中才走序列化路径
+            else:
+                hit_json_cols = []              # 显式声明：本批无 JSON 列
+        else:
+            hit_json_cols = []                  # 本库未配 jsfields
+        # ==========================================================
+
         columns = list(df.columns)
         col_str = ", ".join(columns)
         placeholders = ", ".join(["%s"] * len(columns))
 
-        # 生成 ON DUPLICATE KEY UPDATE 子句
-        update_clause = ", ".join([f"{col} = VALUES({col})" for col in columns])
+        # ============ 校验 sql_exprs 的列名合法性 ============
+        exprs = sql_exprs or {}
+        bad_cols = [c for c in exprs if c not in df.columns]
+        if bad_cols:
+            raise ValueError(
+                f"sql_exprs 中引用了 df 里不存在的列: {bad_cols}；"
+                f"df 现有列: {columns}"
+            )
+        # ============ 生成 ON DUPLICATE KEY UPDATE 子句 ============
+        # 命中 sql_exprs 的列：col = <调用方表达式>（原子操作）
+        # 未命中列：            col = VALUES(col)      （整列覆盖，兼容旧行为）
+        update_clause = ", ".join(
+            f"{col} = {exprs[col]}" if col in exprs else f"{col} = VALUES({col})"
+            for col in columns
+        )
+        # ==========================================================
 
-        # 最终SQL（MySQL 专用，高性能）
         sql = f"""
             INSERT INTO {table} ({col_str})
             VALUES ({placeholders})
             ON DUPLICATE KEY UPDATE {update_clause}
         """
 
-        # 批量参数
         params = df.to_numpy().tolist()
 
-        # 执行
         with self.connection_manager() as conn:
             cursor = conn.cursor()
             cursor.executemany(sql, params)
             conn.commit()
             affected = cursor.rowcount
             cursor.close()
-            print(f"✅ insert_or_update 执行完成 | 影响行数：{affected} | 总数据：{len(df)}")
+            print(f"✅ upsert 完成 | 表：{table} | 影响行数：{affected} | 总数据：{len(df)} ")
         return affected
 
     def bulk_update(self, table, df, key):
@@ -589,54 +618,28 @@ if __name__ == "__main__":
     # 测试单条插入（jhd 库配置了 jsfields=['slct_reason']，会自动 JSON 编码）
     data = {'id': 9001, 'slct_reason': {'code': 3, 'msg': 'invalid'}}
     db_jhd.insert_single('ts_import', data)
-
-    # 测试批量插入
-    df = pd.DataFrame({
-        'id': [9002, 9003],
-        'slct_reason': [['a', 'b'], {'k': 1}],
-    })
-    db_jhd.bulkInsert('ts_import', df)
-
-    # 测试批量更新
-    df_update = pd.DataFrame({
-        'id': [1, 2],
-        'col1': ['new_value1', 'new_value3'],
-        'col2': ['new_value2', 'new_value4']
-    })
-    db_jhd.bulk_update('my_table', df_update, key='id')
     
     #下面测试json字段
-    # 方式 1：直接走 SQL（推荐，高效）
+    # 查询方式 1：
     rows = db_jhd.query(
         "SELECT * FROM tst_json WHERE tst_js->>'$.key1' LIKE 'Y%'",
         dct=True
     )
-    
-    with db_jhd.connection_manager() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE tst_json
-            SET tst_js = JSON_SET(tst_js, '$.key1', CONCAT('Y', tst_js->>'$.key1'))
-            WHERE id = %s AND tst_js->>'$.key1' IS NOT NULL
-        """, (12345,))
-        conn.commit()
-        print(f"影响行数: {cursor.rowcount}")
-        cursor.close()
-
+    #查询2
     df = db_jhd.qry2df(sql="select * from my_choice_stock")
     df['slct_reason'] = df['slct_reason'].str['市盈率']
     df['slct_reason'] = df['slct_reason'].apply(lambda d: d.get('key1') if isinstance(d, dict) else None)
-    
+    #更新
     df = pd.DataFrame({
-        'id':     [1, 2, 3],
-        'name':   ['A', 'B', 'C'],
+        'tst_code':     ['1', '2', '3'],
+        'tst_exp':   ['A', 'B', 'C'],
         'tst_js': [
             {'key1': 'abc', 'key2': 100},           # dict → 自动 dumps
             {'key1': 'def', 'tags': ['x', 'y']},
             {'key1': 'ghi', 'nested': {'a': 1}},
         ],
     })
-
+    exprs = {'tst_exp': "concat('Y',values(tst_exp)","tst_js":"JSON_MERGE_PATCH(COALESCE(tst_js, '{}'), VALUES(tst_js))"}
     db.bulkInsUpd(df, 'tst_json')
     
     
