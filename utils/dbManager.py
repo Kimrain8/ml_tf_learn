@@ -1,9 +1,10 @@
 # 创建数据库引擎管理模块（db_manager.py）
 import os
+import json
 import pandas as pd
 import numpy as np
 import mysql.connector
-from mysql.connector import Error,errorcode
+from mysql.connector import Error, errorcode
 from queue import Queue, Empty
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +13,7 @@ from utils.JSONConfig import ConfigHandler
 
 class MySQLHelper:
     # 【改动】不再是单个实例，而是实例缓存池：key=db名称，value=MySQLHelper实例
+    # 待修正：数据库密码不能放到实例中。
     _instance_pool = {}
 
     def __new__(cls, *args, **kwargs):
@@ -46,13 +48,19 @@ class MySQLHelper:
         self.database = cfg['dbname']
         self.max_connections = cfg['maxconnection']
         self.connections = Queue(maxsize=self.max_connections)
+        # JSON 字段清单：配置里没有 → None（本库无 JSON 字段）
+        # 用 frozenset：O(1) 查找、不可变、内存友好
+        js = cfg.get('jsfields')
+        self.jsfields = frozenset(js) if js else None
         self._initialize_connections()
         # 设置初始化标记，后续__init__直接跳过
         self._initialized = True
 
     def _initialize_connections(self):
-        init_count = min(3, self.max_connections)
-        for _ in range(init_count):
+        """初始化连接池，最多填充到 min(3, max_connections) 个。
+        修复：put 前检查 qsize，避免队列已满时 put 阻塞（truncate 场景）"""
+        target = min(3, self.max_connections)
+        while self.connections.qsize() < target:
             conn = self._create_connection()
             if conn:
                 self.connections.put(conn)
@@ -144,7 +152,6 @@ class MySQLHelper:
 
     def close_all(self):
         """ 关闭当前db实例下所有连接 """
-        temp_connections = []
         while not self.connections.empty():
             try:
                 connection = self.connections.get_nowait()
@@ -155,7 +162,6 @@ class MySQLHelper:
                     except:
                         pass
                     connection.close()
-                temp_connections.append(connection)
             except Empty:
                 break
         print(f"[{self.db}] 所有连接已关闭")
@@ -168,12 +174,95 @@ class MySQLHelper:
         cls._instance_pool.clear()
         print("✅ 全部数据库连接池已清空")
 
+    # ==================== JSON 字段处理工具 ====================
+    #
+    # 设计要点：
+    #   1) self.jsfields 为 frozenset 或 None；
+    #   2) 每个入口方法第一句 `if not self.jsfields: return` 短路，
+    #      配置里没写 jsfields 的库 → 与改造前完全一致，零额外开销；
+    #   3) 写入：dict/list → JSON 字符串；已是字符串则透传（兼容旧代码）；
+    #   4) 读取：JSON 字符串 → dict/list；解析失败原样返回（兼容脏数据）。
+    #
+
+    def _json_serialize_value(self, v):
+        """单值序列化：dict/list/tuple → JSON 字符串；其它原样返回"""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            # 用户自己已经 dumps 过 → 透传，不二次编码
+            return v
+        if isinstance(v, (dict, list, tuple)):
+            try:
+                return json.dumps(v, ensure_ascii=False, default=str)
+            except (TypeError, ValueError) as e:
+                print(f"Warning: JSON 序列化失败 {v} → {e}")
+                return v
+        return v
+
+    def _json_deserialize_value(self, v):
+        """单值反序列化：JSON 字符串 → dict/list；失败原样返回"""
+        if v is None:
+            return None
+        if isinstance(v, (dict, list)):
+            return v
+        # MySQL 部分驱动会把 JSON 列返回为 bytes
+        if isinstance(v, (bytes, bytearray)):
+            try:
+                v = v.decode('utf-8')
+            except Exception:
+                return v
+        if isinstance(v, str):
+            s = v.strip()
+            if not s or s[0] not in '{["':
+                return v
+            try:
+                return json.loads(s)
+            except (ValueError, TypeError):
+                return v
+        return v
+
+    def _serialize_record(self, data: dict) -> dict:
+        """对 dict 数据中属于 jsfields 的字段做序列化（返回新 dict，不改入参）"""
+        if not self.jsfields or not isinstance(data, dict):
+            return data
+        # 只有命中列才做 dumps，未命中列保持原引用
+        hit = self.jsfields & data.keys()
+        if not hit:
+            return data
+        return {k: (self._json_serialize_value(v) if k in hit else v)
+                for k, v in data.items()}
+
+    def _serialize_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """对 DataFrame 中属于 jsfields 的列做序列化（未命中直接返回原对象）"""
+        if not self.jsfields or df is None or df.empty:
+            return df
+        js_cols = [c for c in df.columns if c in self.jsfields]
+        if not js_cols:
+            return df
+        df = df.copy()
+        for c in js_cols:
+            df[c] = df[c].apply(self._json_serialize_value)
+        return df
+
+    def _deserialize_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """对 DataFrame 中属于 jsfields 的列做反序列化（未命中直接返回原对象）"""
+        if not self.jsfields or df is None or df.empty:
+            return df
+        js_cols = [c for c in df.columns if c in self.jsfields]
+        if not js_cols:
+            return df
+        df = df.copy()
+        for c in js_cols:
+            df[c] = df[c].apply(self._json_deserialize_value)
+        return df
+
     def insert_single(self, table, data):
         """
         table：对应数据库的表名
         data：字典数据，其中key对应的是table中的列
         """
         # 插入单条记录
+        data = self._serialize_record(data)
         with self.connection_manager() as connection:
             cursor = None
             try:
@@ -193,10 +282,11 @@ class MySQLHelper:
                 # 无论成功失败，确保关闭cursor
                 if cursor:
                     cursor.close()
+        return 1
 
     def bulkInsert(self, table, df):
         """ 批量插入DataFrame """
-
+        df = self._serialize_df(df)
         with self.connection_manager() as connection:
             cursor = None
             try:
@@ -204,8 +294,10 @@ class MySQLHelper:
                 placeholders = ','.join(['%s'] * len(df.columns))
                 columns = ','.join(df.columns)
                 sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
-                data = [tuple(x) for x in df.values]
+                # 性能优化：to_numpy().tolist() 比 [tuple(x) for x in df.values] 快
+                data = df.to_numpy().tolist()
                 cursor.executemany(sql, data)
+                affected = cursor.rowcount
                 connection.commit()
                 print(f"✅ 批量插入成功，共{len(data)}条")
             except Exception as e:
@@ -217,6 +309,7 @@ class MySQLHelper:
                 # 无论成功失败，确保关闭cursor
                 if cursor:
                     cursor.close()
+        return affected
 
     def bulkInsUpd(self, df, table):
         """
@@ -228,6 +321,7 @@ class MySQLHelper:
             print("✅ DataFrame 为空，无需操作")
             return
         df = df.replace({np.nan: None})
+        df = self._serialize_df(df)
         # 列和占位符
         columns = list(df.columns)
         col_str = ", ".join(columns)
@@ -254,51 +348,7 @@ class MySQLHelper:
             affected = cursor.rowcount
             cursor.close()
             print(f"✅ insert_or_update 执行完成 | 影响行数：{affected} | 总数据：{len(df)}")
-
-    def query(self, sql, dct=True):
-        """ 执行查询，返回列表（字典/元组格式）"""
-        with self.connection_manager() as connection:
-            cursor = None
-            try:
-                cursor = connection.cursor(dictionary=dct)
-                cursor.execute(sql)
-                result = cursor.fetchall()
-                return result
-            except Exception as e:
-                print(f"❌ 查询失败，错误信息: {str(e)}")
-                raise
-            finally:
-                if cursor:
-                    cursor.close()
-
-    def query2df(self, sql):
-        """ 查询并返回DataFrame（用pandas内置方法）"""
-        with self.connection_manager() as connection:
-            try:
-                df = pd.read_sql(sql, connection)
-                return df
-            except Exception as e:
-                print(f"❌ 数据读取失败。错误信息: {str(e)}")
-                raise
-
-    def qry2df(self, sql):
-        """ 手动查询并返回DataFrame（兼容低版本pandas）"""
-        with self.connection_manager() as connection:
-            cursor = None
-            try:
-                cursor = connection.cursor()
-                cursor.execute(sql)
-                columns = [desc[0] for desc in cursor.description]
-                data = cursor.fetchall()
-                # 修复：Dataframe改为DataFrame
-                df = pd.DataFrame(data, columns=columns)
-                return df
-            except Exception as e:
-                print(f"❌ 数据读取失败。错误信息: {str(e)}")
-                raise
-            finally:
-                if cursor:
-                    cursor.close()
+        return affected
 
     def bulk_update(self, table, df, key):
         """
@@ -307,6 +357,7 @@ class MySQLHelper:
         key:  唯一索引列，可以是 字符串(单列) 或 list(多列联合主键)
               例如 key='id' 或 key=['user_id', 'trade_date']
         """
+        df = self._serialize_df(df)
         with self.connection_manager() as connection:
             cursor = connection.cursor()
             update_count = 0
@@ -317,26 +368,22 @@ class MySQLHelper:
             else:
                 key_columns = list(key)
 
-            for index, row in df.iterrows():
-                # ================== 生成 SET 子句（排除主键）==================
-                set_columns = [col for col in df.columns if col not in key_columns]
-                set_clause = ','.join([f"{col} = %s" for col in set_columns])
+            # ================== 循环外预计算 SQL 片段（性能优化）==================
+            set_columns = [col for col in df.columns if col not in key_columns]
+            set_clause = ','.join([f"{col} = %s" for col in set_columns])
+            where_clause = ' AND '.join([f"{k} = %s" for k in key_columns])
+            sql = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
 
-                # ================== 生成 WHERE 子句（多列用 AND 连接）==================
-                where_clause = ' AND '.join([f"{k} = %s" for k in key_columns])
-
-                # ================== 拼接最终 SQL ==================
-                sql = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
-
-                # ================== 参数顺序：先赋值列，再主键列 ==================
+            for _, row in df.iterrows():
+                # 参数顺序：先赋值列，再主键列
                 values = [row[col] for col in set_columns] + [row[col] for col in key_columns]
-
                 cursor.execute(sql, values)
                 update_count += 1
 
             connection.commit()
             print(f"批量更新成功，共 {update_count} 条")
             cursor.close()
+            return update_count
 
     def bulkUpd(self, table, df, key):
         """
@@ -345,6 +392,7 @@ class MySQLHelper:
         key:  主键/唯一键，可以是 str 或 list（多列联合主键）
         """
         # 统一转为列表（兼容单列/多列）
+        df = self._serialize_df(df)
         if isinstance(key, str):
             key_cols = [key]
         else:
@@ -373,6 +421,7 @@ class MySQLHelper:
             rowcount = cursor.rowcount
             cursor.close()
             print(f"✅ 批量更新完成 | 影响行数：{rowcount} | 总条数：{len(df)}")
+        return rowcount
 
     def delete(self, table, condition):
         """ 删除数据（注意condition需自行确保安全，避免SQL注入）"""
@@ -381,8 +430,10 @@ class MySQLHelper:
             sql = f"DELETE FROM {table} WHERE {condition}"
             cursor.execute(sql)
             connection.commit()
-            print(f"删除成功，影响行数：{cursor.rowcount}")
+            cnt = cursor.rowcount
+            print(f"删除成功，影响行数：{cnt}")
             cursor.close()
+        return cnt
 
     def delFromDf(self, df, table):
         """
@@ -393,6 +444,7 @@ class MySQLHelper:
         if df.empty:
             print("✅ DataFrame 为空，无需删除")
             return
+        df = self._serialize_df(df)
         # 拼接 WHERE 条件：列1=%s AND 列2=%s AND ...
         where_conditions = " AND ".join([f"{col} = %s" for col in df.columns])
         sql = f"DELETE FROM {table} WHERE {where_conditions}"
@@ -403,10 +455,26 @@ class MySQLHelper:
             try:
                 cursor.executemany(sql, params)
                 conn.commit()
-                print(f"✅ 批量删除完成 | 表：{table} | 条件列：{list(df.columns)} | 影响行数：{cursor.rowcount}")
+                cnt = cursor.rowcount
+                print(f"✅ 批量删除完成 | 表：{table} | 条件列：{list(df.columns)} | 影响行数：{cnt}")
             except Exception as e:
                 conn.rollback()
                 print(f"❌ 批量删除失败，已回滚 | 错误信息：{str(e)}")
+                raise
+            finally:
+                cursor.close()
+        return cnt
+
+    def execute_raw(self, sql, params=None):
+        """执行任意写 SQL（UPDATE / DELETE / 复杂 INSERT），返回影响行数"""
+        with self.connection_manager() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(sql, params or ())
+                conn.commit()
+                return cursor.rowcount
+            except Exception as e:
+                conn.rollback()
                 raise
             finally:
                 cursor.close()
@@ -421,18 +489,93 @@ class MySQLHelper:
             connection.commit()
             print(f"表{table}已清空")
             cursor.close()
-        # 重新初始化连接
+        # 关闭刚释放回队列的连接，再重新初始化，避免 qsize 累加导致 put 阻塞
+        self.close_all()
         self._initialize_connections()
+        return 0
 
-    def lookUpColName(self,df):
+    def query(self, sql, dct=True):
+        """ 执行查询，返回列表（字典/元组格式）；jsfields 命中时自动反序列化 """
+        with self.connection_manager() as connection:
+            cursor = None
+            try:
+                cursor = connection.cursor(dictionary=dct)
+                cursor.execute(sql)
+                result = cursor.fetchall()
+
+                # self.jsfields 为 None → 一句短路，完全跳过
+                if self.jsfields and result:
+                    cols_list = [d[0] for d in cursor.description]
+                    js_idx = [i for i, c in enumerate(cols_list) if c in self.jsfields]
+
+                    # 本次结果里没有 JSON 列 → 也不做任何逐行处理
+                    if js_idx:
+                        if dct:
+                            hit = {cols_list[i] for i in js_idx}
+                            for r in result:
+                                for k in hit:
+                                    if k in r:
+                                        r[k] = self._json_deserialize_value(r[k])
+                        else:
+                            new_result = []
+                            for r in result:
+                                r = list(r)
+                                for i in js_idx:
+                                    r[i] = self._json_deserialize_value(r[i])
+                                new_result.append(tuple(r))
+                            result = new_result
+
+                return result
+            except Exception as e:
+                print(f"❌ 查询失败，错误信息: {str(e)}")
+                raise
+            finally:
+                if cursor:
+                    cursor.close()
+
+    def query2df(self, sql):
+        """ 查询并返回DataFrame（用pandas内置方法）；jsfields 命中时自动反序列化 """
+        with self.connection_manager() as connection:
+            try:
+                df = pd.read_sql(sql, connection)
+                df = self._deserialize_df(df)   # ← JSON 字段自动解码（未命中直接返回原 df）
+                return df
+            except Exception as e:
+                print(f"❌ 数据读取失败。错误信息: {str(e)}")
+                raise
+
+    def qry2df(self, sql):
+        """ 手动查询并返回DataFrame（兼容低版本pandas）；jsfields 命中时自动反序列化 """
+        with self.connection_manager() as connection:
+            cursor = None
+            try:
+                cursor = connection.cursor()
+                cursor.execute(sql)
+                columns = [desc[0] for desc in cursor.description]
+                data = cursor.fetchall()
+                df = pd.DataFrame(data, columns=columns)
+                df = self._deserialize_df(df)   # ← JSON 字段自动解码
+                return df
+            except Exception as e:
+                print(f"❌ 数据读取失败。错误信息: {str(e)}")
+                raise
+            finally:
+                if cursor:
+                    cursor.close()
+
+    def lookUpColName(self, df):
         """把字段映射为可以理解的短备注
         df: 需要转换为中文标题的df"""
-        sql = f"""select distinct cols.COLUMN_NAME, \
-            SUBSTRING_INDEX(cols.COLUMN_COMMENT,'~',1) as COLUMN_COMMENT \
-            from information_schema.`COLUMNS` as cols \
-            where cols.TABLE_SCHEMA = 'jhd'"""
+        sql = (
+            "select distinct cols.COLUMN_NAME, "
+            "SUBSTRING_INDEX(cols.COLUMN_COMMENT,'~',1) as COLUMN_COMMENT "
+            "from information_schema.`COLUMNS` as cols "
+            f"where cols.TABLE_SCHEMA = '{self.database}'"
+        )
         cols = self.qry2df(sql)
-        cols["COLUMN_COMMENT"] = cols["COLUMN_COMMENT"].apply(lambda x: x.decode('utf-8') if isinstance(x, bytes) else x)
+        cols["COLUMN_COMMENT"] = cols["COLUMN_COMMENT"].apply(
+            lambda x: x.decode('utf-8') if isinstance(x, bytes) else x
+        )
         colmap = cols['COLUMN_COMMENT']
         colmap.index = cols['COLUMN_NAME']
         return df.columns.map(colmap)
@@ -443,26 +586,57 @@ if __name__ == "__main__":
     db_jhd = MySQLHelper(db='jhd')
     db_ginger = MySQLHelper(db='ginger2')
 
-    # 同一个db多次实例化，拿到同一个对象
-    db_jhd2 = MySQLHelper(db='jhd')
-    print(f"db_jhd is db_jhd2 ? {db_jhd is db_jhd2}") # True
-    
-    # 测试单条插入
-    data = {'id': 9001, '1v5': '测试1'}
-    db.insert_single('ts_import', data)
-    
+    # 测试单条插入（jhd 库配置了 jsfields=['slct_reason']，会自动 JSON 编码）
+    data = {'id': 9001, 'slct_reason': {'code': 3, 'msg': 'invalid'}}
+    db_jhd.insert_single('ts_import', data)
+
     # 测试批量插入
-    df = pd.DataFrame({'id': [9002, 9003], '1v5': ['测试2', '测试3']})  # 修复字典语法
-    db.bulk_insert('ts_import', df)
-    
-    # 测试查询
-    result = db.query('SELECT * FROM ts_import where minid is null', True)
-    print("查询结果：", result)
-    
+    df = pd.DataFrame({
+        'id': [9002, 9003],
+        'slct_reason': [['a', 'b'], {'k': 1}],
+    })
+    db_jhd.bulkInsert('ts_import', df)
+
     # 测试批量更新
     df_update = pd.DataFrame({
         'id': [1, 2],
         'col1': ['new_value1', 'new_value3'],
-        'col2': ['new_value2', 'new_value4']  # 修复co12为col2
+        'col2': ['new_value2', 'new_value4']
     })
-    db.bulk_update('my_table', df_update, key='id')
+    db_jhd.bulk_update('my_table', df_update, key='id')
+    
+    #下面测试json字段
+    # 方式 1：直接走 SQL（推荐，高效）
+    rows = db_jhd.query(
+        "SELECT * FROM tst_json WHERE tst_js->>'$.key1' LIKE 'Y%'",
+        dct=True
+    )
+    
+    with db_jhd.connection_manager() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tst_json
+            SET tst_js = JSON_SET(tst_js, '$.key1', CONCAT('Y', tst_js->>'$.key1'))
+            WHERE id = %s AND tst_js->>'$.key1' IS NOT NULL
+        """, (12345,))
+        conn.commit()
+        print(f"影响行数: {cursor.rowcount}")
+        cursor.close()
+
+    df = db_jhd.qry2df(sql="select * from my_choice_stock")
+    df['slct_reason'] = df['slct_reason'].str['市盈率']
+    df['slct_reason'] = df['slct_reason'].apply(lambda d: d.get('key1') if isinstance(d, dict) else None)
+    
+    df = pd.DataFrame({
+        'id':     [1, 2, 3],
+        'name':   ['A', 'B', 'C'],
+        'tst_js': [
+            {'key1': 'abc', 'key2': 100},           # dict → 自动 dumps
+            {'key1': 'def', 'tags': ['x', 'y']},
+            {'key1': 'ghi', 'nested': {'a': 1}},
+        ],
+    })
+
+    db.bulkInsUpd(df, 'tst_json')
+    
+    
