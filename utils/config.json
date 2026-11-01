@@ -1,0 +1,31 @@
+{
+    "ginger2": {
+        "username": "root",
+        "password": "gAAAAABpvgUEXxKLKD57aU6sQBoSQuRZ3cEcezpRdLStZbVBcH59I-KMXVTKboT8uTQTwIMP6kYial3WTqj73NkW5bd0x5dOnw==",
+        "host": "127.0.0.1",
+        "port": "3308",
+        "dbname": "ginger2",
+        "api_key": "api456",
+        "maxconnection": 5
+    },
+	"jhd": {
+        "username": "root",
+        "password": "gAAAAABpvgUEXxKLKD57aU6sQBoSQuRZ3cEcezpRdLStZbVBcH59I-KMXVTKboT8uTQTwIMP6kYial3WTqj73NkW5bd0x5dOnw==",
+        "host": "127.0.0.1",
+        "port": "3308",
+        "dbname": "jhd",
+        "api_key": "api456",
+        "maxconnection": 5,
+		"jsfields": ["slct_reason", "tst_js"]
+    },
+	"jhd_rd": {
+        "username": "rd",
+        "password": "gAAAAABqtxdEhdvpp9qJJtzirARC58rOWqUH_gJT9WwNSh668wDwCRRxFW9HIymC9jecu58uLXT263u7aOsVBUnVIdpPbzQGmA==",
+        "host": "127.0.0.1",
+        "port": "3308",
+        "dbname": "jhd",
+        "api_key": "api456",
+        "maxconnection": 5,
+		"jsfields": ["slct_reason", "tst_js"]
+    }
+}

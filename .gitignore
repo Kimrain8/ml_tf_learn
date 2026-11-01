@@ -1,0 +1,15 @@
+audio/
+mydata/
+media/
+checkpoints/
+.ipynb_checkpoints/
+venv/
+.venv/
+.env
+*.log
+*.lock
+*.state.json
+**/__pycache__/
+*.pyc
+*.ckpt
+*.pth

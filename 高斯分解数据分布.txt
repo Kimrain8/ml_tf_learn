@@ -1,0 +1,143 @@
+#将多峰分布拆解为多个高斯分布
+from sklearn.mixture import GaussianMixture
+import numpy as np
+
+# 1. 准备数据：假设你的多峰数据存在变量 'data' 中
+data = iris.data[:,1]
+
+# 2. 创建并训练GMM模型
+# 关键：n_components 参数需要指定你想拆分成几个高斯分布
+n_components = 3  # 假设你看到数据有3个峰
+gmm = GaussianMixture(n_components=n_components)
+gmm.fit(data.reshape(-1, 1)) # 对于一维数据，需要reshape
+
+# 3. 提取拆分后的各个高斯分布参数
+means = gmm.means_                 # 每个峰的均值 (位置)
+standard_deviations = gmm.covariances_**0.5  # 每个峰的标准差 (宽度)
+weights = gmm.weights_             # 每个峰的混合权重 (相对大小)
+
+print(f"均值: {means}")
+print(f"标准差: {standard_deviations}")
+print(f"权重: {weights}")
+
+
+#继续加入偏度信息
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.mixture import GaussianMixture
+from scipy.stats import norm,skew
+from scipy.stats import mstats
+
+
+def weighted_skewness(data, weights):
+    """
+    计算加权偏度
+    
+    参数:
+        data: 数据数组
+        weights: 权重数组，需要与data长度一致
+    
+    返回:
+        加权偏度值
+    """
+    # 1. 将权重归一化，使其总和为1
+    weights = weights / np.sum(weights)
+    
+    # 2. 计算加权均值
+    mean = np.average(data, weights=weights)
+    
+    # 3. 计算中心矩
+    # 二阶中心矩 (m2)
+    m2 = np.average((data - mean)**2, weights=weights)
+    # 三阶中心矩 (m3)
+    m3 = np.average((data - mean)**3, weights=weights)
+    
+    # 4. 计算偏度: m3 / (m2^(3/2))
+    # 为避免除以0，添加一个极小值
+    return m3 / (m2**1.5 + 1e-10)
+
+# ---------- 1. 准备数据 (如果没有数据，此处生成模拟数据) ----------
+# 如果你有自己的数据，请直接替换下面的 data 变量
+np.random.seed(42)
+# 模拟三个高斯混合的数据：均值-5, 5, 10；标准差1.5, 1.0, 2.0；权重0.3, 0.4, 0.3
+# data_1 = np.random.normal(-5, 1.5, 300)
+# data_2 = np.random.normal(5, 1.0, 400)
+# data_3 = np.random.normal(10, 2.0, 300)
+# data = np.concatenate([data_1, data_2, data_3])
+# data = data.reshape(-1, 1)  # sklearn要求输入为二维
+
+data = iris.data[:,3:4]
+
+# ---------- 2. 使用GMM拟合，提取参数 ----------
+n_components = 3  # 假设我们知道有3个峰，可后续用AIC/BIC调整
+gmm = GaussianMixture(n_components=n_components, random_state=42)
+gmm.fit(data)
+
+# 提取均值、标准差（注意covariances_是方差，需要开根号）、权重
+means = gmm.means_.flatten()
+std_devs = np.sqrt(gmm.covariances_).flatten()
+weights = gmm.weights_.flatten()
+
+print("拟合参数结果：")
+for i in range(n_components):
+    print(f"分量 {i+1}: 权重={weights[i]:.2f}, 均值={means[i]:.2f}, 标准差={std_devs[i]:.2f}")
+
+# ---------- 3. 绘制对比图形 ----------
+# 将数据还原为一维用于画直方图
+data_flat = data.flatten()
+
+# 生成x轴范围（覆盖所有数据，并向外扩展一点）
+x_min = data_flat.min() - 2
+x_max = data_flat.max() + 2
+x = np.linspace(x_min, x_max, 1000)
+
+# 计算总的混合概率密度（用于画红线）
+total_pdf = np.zeros_like(x)
+for i in range(n_components):
+    # 计算每个分量的概率密度
+    component_pdf = weights[i] * norm.pdf(x, means[i], std_devs[i])
+    total_pdf += component_pdf
+
+####下面是计算数据分布偏度
+# 1. 获取每个数据点属于各个分量的概率 (责任度)
+proba = gmm.predict_proba(data.reshape(-1, 1))  # proba 是 (n_samples, n_components) 的数组
+# 2. 计算每个分量的加权偏度
+weighted_skewness_list = []
+for i in range(gmm.n_components):
+    # 使用第 i 个分量的归属概率作为权重，计算加权偏度
+    # 注意：scipy.stats.skew 的 weights 参数需要归一化，但传入未归一化的权重它也会自动处理
+    # w_skew = mstats.skew(data, weights=proba[:, i])
+    w_skew = weighted_skewness(data.flatten(), proba[:, i])
+    weighted_skewness_list.append(w_skew)
+    
+print("各分量的加权偏度:", weighted_skewness_list)
+####计算数据分布偏度（完）
+
+# 开始绘图
+plt.figure(figsize=(10, 6))
+
+# (a) 绘制原始数据的直方图（归一化为密度）
+plt.hist(data_flat, bins=40, density=True, alpha=0.6, 
+         color='skyblue', edgecolor='black', label='原始数据直方图')
+
+# (b) 绘制总的拟合混合高斯曲线
+plt.plot(x, total_pdf, 'r-', linewidth=2.5, label='拟合的混合高斯分布')
+
+# (c) 绘制拆分出来的每一个独立高斯分量（虚线）
+for i in range(n_components):
+    component_pdf = weights[i] * norm.pdf(x, means[i], std_devs[i])
+    plt.plot(x, component_pdf, '--', linewidth=1.5, 
+             label=f'分量 {i+1} (μ={means[i]:.2f}, σ={std_devs[i]:.2f}, 偏度={weighted_skewness_list[i]:.3f})')
+
+# for i in range(n_components):
+#     # ... (计算 component_pdf) ...
+#     plt.plot(x, component_pdf, '--', linewidth=1.5, 
+#              label=f'分量 {i+1} (μ={means[i]:.2f}, σ={std_devs[i]:.2f}, 偏度={weighted_skewness[i]:.3f})')
+
+# 添加信息
+plt.xlabel('数据值', fontsize=12)
+plt.ylabel('概率密度', fontsize=12)
+plt.title('GMM拟合效果对比：直方图 vs 拆分后的高斯分量', fontsize=14)
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()

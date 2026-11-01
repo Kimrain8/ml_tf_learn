@@ -1,0 +1,19 @@
+Tokenizer 增强
+如果未来要引入 行业/产品/竞争对手的文本描述，可以在 StockDataTokenizer 中增加一个预训练语言模型（如 bert-base-chinese 的金融微调版）作为文本编码器，并将输出投影到 d_model。简要示例：
+
+class TextEntityTokenizer:
+    def __init__(self, config, model_name="bert-base-chinese"):
+        from transformers import AutoModel, AutoTokenizer
+        self.bert = AutoModel.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.proj = nn.Linear(self.bert.config.hidden_size, config.d_model)
+        # 冻结BERT参数？看情况
+    def encode(self, text_list):
+        # 输入文本列表，返回投影后的 token embeddings
+        inputs = self.tokenizer(text_list, return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():
+            outputs = self.bert(**inputs).last_hidden_state  # (B, L, hidden)
+        return self.proj(outputs)  # (B, L, d_model)
+
+然后将这个 TextEntityTokenizer 的输出替换或拼接原有的可学习实体嵌入即可。
+以上代码构建了一套完整的 Transformer 股票预测 pipeline，模块化清晰，可直接嵌入你的真实数据流。关键点在于 多源信息的统一 token 化 与 Transformer 的全注意力交互，这正是你提出的关联挖掘的核心实现。
