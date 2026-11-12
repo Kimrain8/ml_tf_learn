@@ -1,15 +1,20 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from IPython import embed
 
-# ---------------------- 1. 数据 ----------------------
-x_np = np.linspace(-2 * np.pi, 2 * np.pi, 1000).reshape(-1, 1)
-y_np = np.sin(x_np)
-x = torch.from_numpy(x_np).float()
-y = torch.from_numpy(y_np).float()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+x = np.linspace(-2 * np.pi, 3 * np.pi, 400)
+y = np.sin(x)
+x_tsr = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(-1).to(device)
+# print(x_tsr.shape)
+y_tsr = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1).to(device)
+# print(y_tsr.shape)
 
 # ---------------------- 2. 位置编码（必须！Transformer没有位置感知） ----------------------
 class PositionalEncoding(nn.Module):
@@ -42,9 +47,15 @@ class XPosEncoding(nn.Module):
         B, L, _ = x.shape
         pe = torch.zeros(B, L, self.d_model, device=x.device, dtype=x.dtype)
         # [B, L, 1] * [32] -> [B, L, 32]
-        arg = x * self.div_term.unsqueeze(0).unsqueeze(0)
+        # arg = x * self.div_term.unsqueeze(0).unsqueeze(0)
+        arg = x * self.div_term[None,None,:]
         pe[..., 0::2] = torch.sin(arg)
         pe[..., 1::2] = torch.cos(arg)
+        # position = torch.arange(seq_len, ...).unsqueeze(1)
+        # pe[:, 0::2] = torch.sin(position * div_term)
+        # pe[:, 1::2] = torch.cos(position * div_term)
+        # x = x + pe.unsqueeze(0)
+        
         return pe
 
 # ---------------------- 3. Transformer 回归模型 ----------------------
@@ -60,21 +71,26 @@ class TransformerSinModel(nn.Module):
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            batch_first=False,
+            batch_first=True, #False,
+            # activation=F.silu,
+            activation='gelu',
             dropout=0.0
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        # 输出映射 d_model -> 1
         self.output_proj = nn.Linear(d_model, 1)
 
     def forward(self, x):
         # x shape: [B, 1]  (batch, feature)
+        
         B = x.shape[0]
-        x = self.input_proj(x)          # [B, d_model]
-        x = x.unsqueeze(0)              # [seq_len=1, B, d_model]
-        x = self.pe(x)                  # 加位置编码
-        x = self.encoder(x)             # transformer encoder [1, B, d_model]
-        out = self.output_proj(x[0])    # 取唯一token输出 [B,1]
+        emb = self.input_proj(x)          # [B, d_model]
+        # x = x.unsqueeze(0)              # [seq_len=1, B, d_model]
+        pos = self.pe(x)                  # 加位置编码
+        emb = emb + pos
+        # print(emb.shape)
+        x = self.encoder(emb)             # transformer encoder [1, B, d_model]
+        # print(x.shape)
+        out = self.output_proj(x)
         return out
 
 model = TransformerSinModel(d_model=64, nhead=4, num_layers=2)
@@ -84,26 +100,35 @@ criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 epochs = 8000
 
+
 for epoch in range(epochs):
-    y_pred = model(x)
-    loss = criterion(y_pred, y)
+    y_pred = model(x_tsr)
+    loss = criterion(y_pred, y_tsr)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    if (epoch+1) % 500 == 0:
+    if (epoch+1) % 1000 == 0:
         print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}")
 
+torch.save(model.state_dict(), "D:/pyprj/cv2/NeuralNetwork/sin_tf1.pth")
+# embed()
+# ---------------------- 5. 自增加，主要是检验超出范围的x对应的值 ----------------------
 
-# ---------------------- 5. 自增加 ----------------------
-import pandas as pd
-x_np = np.linspace(0 * np.pi, 4 * np.pi, 1000).reshape(-1, 1)
+x_np = np.linspace(3 * np.pi, 5 * np.pi, 500)
+x_np = np.concatenate((x,x_np))
 y_np = np.sin(x_np)
-x = torch.from_numpy(x_np).float()
-y = torch.from_numpy(y_np).float()
+
+# x_tensor = torch.from_numpy(x_np).float()
+# y_tensor = torch.from_numpy(y_np).float()
+x_tensor = torch.from_numpy(x_np).float().unsqueeze(0).unsqueeze(-1).to(device)
+y_tensor = torch.from_numpy(y_np).float().unsqueeze(0).unsqueeze(-1).to(device)
 with torch.no_grad():
-    y_pred = model(x)
-y_pred = y_pred.detach().cpu().numpy()
-df = pd.DataFrame(data=np.column_stack((x_np[:,0], y_pred) ),columns=['x','y'])
+    y_pred = model(x_tensor)
+print(y_pred.shape)
+y_pred = y_pred.detach().cpu().numpy().squeeze()
+print(y_pred.shape)
+
+df = pd.DataFrame(data=np.column_stack((x_np,y_np, y_pred) ),columns=['x','y','y_pred'])
 df.to_pickle("tst_sin4.pkl")
 
 # ---------------------- 5. 绘图 ----------------------
@@ -112,7 +137,7 @@ df.to_pickle("tst_sin4.pkl")
 
 plt.figure(figsize=(10,5))
 plt.plot(x_np, y_np, label="True sin(x)", c="blue")
-plt.plot(x_np, y_pred.numpy(), label="Transformer predict", c="orange", linestyle="--")
+plt.plot(x_np, y_pred, label="Transformer predict", c="orange", linestyle="--")
 plt.legend()
 plt.title("Transformer fit sin(x)")
 plt.show()

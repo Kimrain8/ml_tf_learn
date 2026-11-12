@@ -1,8 +1,11 @@
 audio/
 mydata/
 media/
-checkpoints/
-.ipynb_checkpoints/
+data/
+NeuralNetwork/transformer/data
+**/checkpoints/
+**/.ipynb_checkpoints/
+iframe_figures/
 venv/
 .venv/
 .env
@@ -13,3 +16,5 @@ venv/
 *.pyc
 *.ckpt
 *.pth
+*.wav
+config.json

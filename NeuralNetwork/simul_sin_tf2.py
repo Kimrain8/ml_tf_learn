@@ -93,7 +93,7 @@ for epoch in range(8000):
 
 
 # embed()
-torch.save(model.state_dict(), "D:/pyprj/cv2/NeuralNetwork/best_sin.pth")
+torch.save(model.state_dict(), "D:/pyprj/cv2/NeuralNetwork/sin_tf2.pth")
 # 推理绘图
 x2 = np.linspace(0, 6 * np.pi, 700)
 y2 = np.sin(x2)

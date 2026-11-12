@@ -51,6 +51,7 @@ mplcursors = "*"
 jieba = "*"
 pyopengl = "*"
 pyopengl-accelerate = "*"
+pyqt6 = "*"
 
 [dev-packages]
 

@@ -1486,8 +1486,8 @@ class MyTools:
 
     @staticmethod
     def myVRectV(A,B,d='N'):
-        """求垂直于B的向量，此向量是A向量的投影
-        d：表示是否返回 A@B的值
+        """求垂直于B的向量, 此向量是A向量的投影
+        d: 表示是否返回 A@B的值
         """
         if B is None:
             B = A[:,1]
@@ -1777,23 +1777,23 @@ if __name__ == "__main__":
     })
     
     # 调用 myPlt1
-    fig1, ax1 = myPlt1(df_example, atts=['CTE', 'DF', 'DK'], mdl='model_name')
+    fig1, ax1 = MyTools.myPltTypeNum(df_example, atts=['CTE', 'DF', 'DK'], mdl='model_name')
     
     # 调用 myPlt2
-    fig2, ax2 = myPlt2(df_example, cols=['CTE', 'DF', 'DK', 'Density'], mdl='model_name')
+    fig2, ax2 = MyTools.myPltNumNum(df_example, cols=['CTE', 'DF', 'DK', 'Density'], mdl='model_name')
     
     #下面测试myPlotP
     # 示例1：绘制单个向量
     v = np.array([1, 2, 3])
-    myPlotP(v)
+    MyTools.myPlotV(v)
     
     # 示例2：绘制多个行向量（需设置axis=1）
     vs = np.array([[1,0,0], [0,1,0], [0,0,1]])  # 每行一个向量
-    myPlotP(vs, axis=1, c=['r', 'g', 'b'])  # 不同颜色
+    MyTools.myPlotV(vs, axis=1, c=['r', 'g', 'b'])  # 不同颜色
     
     # 示例3：在已有坐标轴上叠加绘制
-    fig, ax = myPlotP([1,1,1], show=False)  # 先不显示
-    myPlotP([2,2,2], ax=ax, c='blue')  # 叠加蓝色向量
+    fig, ax = MyTools.myPlotV([1,1,1], show=False)  # 先不显示
+    MyTools.myPlotV([2,2,2], ax=ax, c='blue')  # 叠加蓝色向量
     
     #下面测试myFindSimilar
     # 构造测试数据（混合文本、数值、空值）
@@ -1813,10 +1813,10 @@ if __name__ == "__main__":
     
     # 测试1：默认带相似度的比较模式（Y）
     print("=== 测试1：enable_similarity='Y'（默认带相似度） ===")
-    top3_similar = MyFindSimilar.myFindSimilar(df1, df2, exclude_cols=['id'])
+    top3_similar = MyTools.myFindSimilar(df1, df2, exclude_cols=['id'])
     print(top3_similar)
     
     # 测试2：精确相等比较模式（N）
     print("\n=== 测试2：enable_similarity='N'（精确相等） ===")
-    top3_exact = MyFindSimilar.myFindSimilar(df1, df2, exclude_cols=['id'], enable_similarity='N')
+    top3_exact = MyTools.myFindSimilar(df1, df2, exclude_cols=['id'], enable_similarity='N')
     print(top3_exact)
