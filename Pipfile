@@ -52,6 +52,7 @@ jieba = "*"
 pyopengl = "*"
 pyopengl-accelerate = "*"
 pyqt6 = "*"
+lightgbm = "*"
 
 [dev-packages]
 

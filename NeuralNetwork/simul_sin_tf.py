@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,13 +9,23 @@ import matplotlib.pyplot as plt
 from IPython import embed
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-x = np.linspace(-2 * np.pi, 3 * np.pi, 400)
-y = np.sin(x)
-x_tsr = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(-1).to(device)
-# print(x_tsr.shape)
-y_tsr = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1).to(device)
-# print(y_tsr.shape)
+# 3. 通用训练函数
+def train_model(model, x_train, y_train, epochs=500, lr=1e-4, mask_fn=None):
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        if mask_fn:
+            pred = model(x_train, mask=mask_fn(x_train.size(1), x_train.device))
+        else:
+            pred = model(x_train)
+        loss = loss_fn(pred, y_train)
+        loss.backward()
+        optimizer.step()
+        if (epoch+1) % 100 == 0:
+            print(f"Epoch {epoch+1:3d} | Loss: {loss.item():.6f}")
+    return model
 
 # ---------------------- 2. 位置编码（必须！Transformer没有位置感知） ----------------------
 class PositionalEncoding(nn.Module):
@@ -41,7 +52,6 @@ class XPosEncoding(nn.Module):
         # 提前预计算div_term，注册buffer，不要每次forward都算
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
         self.register_buffer("div_term", div_term)
-
     def forward(self, x):
         # x: [B, L, 1]  真实x坐标
         B, L, _ = x.shape
@@ -93,53 +103,75 @@ class TransformerSinModel(nn.Module):
         out = self.output_proj(x)
         return out
 
-model = TransformerSinModel(d_model=64, nhead=4, num_layers=2)
+
+
 
 # ---------------------- 4. 训练配置 ----------------------
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-epochs = 8000
+# criterion = nn.MSELoss()
+# optimizer = optim.Adam(model.parameters(), lr=1e-4)
+# epochs = 8000
 
+# for epoch in range(epochs):
+#     y_pred = model(x_tsr)
+#     loss = criterion(y_pred, y_tsr)
+#     optimizer.zero_grad()
+#     loss.backward()
+#     optimizer.step()
+#     if (epoch+1) % 1000 == 0:
+#         print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}")
 
-for epoch in range(epochs):
-    y_pred = model(x_tsr)
-    loss = criterion(y_pred, y_tsr)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    if (epoch+1) % 1000 == 0:
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}")
-
-torch.save(model.state_dict(), "D:/pyprj/cv2/NeuralNetwork/sin_tf1.pth")
+# torch.save(model.state_dict(), "D:/pyprj/cv2/NeuralNetwork/sin_tf1.pth")
 # embed()
-# ---------------------- 5. 自增加，主要是检验超出范围的x对应的值 ----------------------
 
-x_np = np.linspace(3 * np.pi, 5 * np.pi, 500)
-x_np = np.concatenate((x,x_np))
-y_np = np.sin(x_np)
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x = np.linspace(-2 * np.pi, 3 * np.pi, 400)
+    y = np.sin(x)
+    x_tsr = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(-1).to(device)
+    # print(x_tsr.shape)
+    y_tsr = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1).to(device)
+    # print(y_tsr.shape)
+    
+    
+    model = TransformerSinModel(d_model=64, nhead=4, num_layers=2)
 
-# x_tensor = torch.from_numpy(x_np).float()
-# y_tensor = torch.from_numpy(y_np).float()
-x_tensor = torch.from_numpy(x_np).float().unsqueeze(0).unsqueeze(-1).to(device)
-y_tensor = torch.from_numpy(y_np).float().unsqueeze(0).unsqueeze(-1).to(device)
-with torch.no_grad():
-    y_pred = model(x_tensor)
-print(y_pred.shape)
-y_pred = y_pred.detach().cpu().numpy().squeeze()
-print(y_pred.shape)
+    if os.path.exists("D:/pyprj/cv2/NeuralNetwork/sin_tf1.pth"):
+        state_dict = torch.load('D:/pyprj/cv2/NeuralNetwork/sin_tf1.pth', map_location='cpu')
+        model.load_state_dict(state_dict)
+    else:
+        model = train_model(model, x_tsr, y_tsr, epochs=5000, lr=1e-3 ) #, mask_fn=get_diag_mask)
+        torch.save(model.state_dict(), "D:/pyprj/cv2/NeuralNetwork/sin_tf1.pth")
+    
+    
+    
+    # ---------------------- 5. 自增加，主要是检验超出范围的x对应的值 ----------------------
 
-df = pd.DataFrame(data=np.column_stack((x_np,y_np, y_pred) ),columns=['x','y','y_pred'])
-df.to_pickle("tst_sin4.pkl")
+    x_np = np.linspace(3 * np.pi, 5 * np.pi, 500)
+    x_np = np.concatenate((x,x_np))
+    y_np = np.sin(x_np)
 
-# ---------------------- 5. 绘图 ----------------------
-# with torch.no_grad():
-#     y_pred = model(x)
+    # x_tensor = torch.from_numpy(x_np).float()
+    # y_tensor = torch.from_numpy(y_np).float()
+    x_tensor = torch.from_numpy(x_np).float().unsqueeze(0).unsqueeze(-1).to(device)
+    y_tensor = torch.from_numpy(y_np).float().unsqueeze(0).unsqueeze(-1).to(device)
+    with torch.no_grad():
+        y_pred = model(x_tensor)
+    print(y_pred.shape)
+    y_pred = y_pred.detach().cpu().numpy().squeeze()
+    print(y_pred.shape)
 
-plt.figure(figsize=(10,5))
-plt.plot(x_np, y_np, label="True sin(x)", c="blue")
-plt.plot(x_np, y_pred, label="Transformer predict", c="orange", linestyle="--")
-plt.legend()
-plt.title("Transformer fit sin(x)")
-plt.show()
+    df = pd.DataFrame(data=np.column_stack((x_np,y_np, y_pred) ),columns=['x','y','y_pred'])
+    df.to_pickle("tst_sin4.pkl")
 
-# embed()
+    # ---------------------- 5. 绘图 ----------------------
+    # with torch.no_grad():
+    #     y_pred = model(x)
+
+    plt.figure(figsize=(10,5))
+    plt.plot(x_np, y_np, label="True sin(x)", c="blue")
+    plt.plot(x_np, y_pred, label="Transformer predict", c="orange", linestyle="--")
+    plt.legend()
+    plt.title("Transformer fit sin(x)")
+    plt.show()
+
+    # embed()

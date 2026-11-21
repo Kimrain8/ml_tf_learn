@@ -195,27 +195,54 @@ def seriesAngles():
     # embed()
     df.to_pickle("tmp_20261110.pkl")
 
+def seriesAngles2():
+    """当向量不断延申，对应的角度变化：[[sin(x),1],[sin(x),1]] -> [[sin(x),1],[sin(x),1],[sin(x),1]]"""
+    x = np.linspace(-np.pi,20*np.pi,700)
+    x2 = np.ones_like(x)
+    y = np.sin(x)
+
+    angles = [0]
+    angles2 = [0]
+    rst = []
+    
+
+    for i in range(3,len(x)+1):
+        
+        arr = np.column_stack((x[:i],x2[:i],y[:i]))
+        Q1,R1 = np.linalg.qr(arr)
+        rst.append([mt.myVectorAngle(R1[:,0],R1[:,2]),mt.myVectorAngle(R1[:,1],R1[:,2]),mt.myVectorAngle(R1[:,0],R1[:,1])])
+        
+
+    
+
+    df = pd.DataFrame(rst,columns=['angle1','angle2','angle3'])
+    df['cnt'] = range(len(df))
+    # embed()
+    df.to_pickle("tmp_20261115.pkl")
+
+
 if __name__ == "__main__":
-    rng = np.random.default_rng(0)
-    x = np.linspace(0, np.pi / 2, 60)
-    y = np.sin(x) + rng.normal(0, 0.002, x.size)
-    lsc = LinearSimCurve(x,y)
-
-    # 日常使用：只要 y_hat 和 mse
-    out = lsc.segmented_linear_regression(x, y, angle_diff_deg=10, mse_threshold=1e-5)
-    print("mse:", out["mse"])
-    # plt.plot(x, out["y_hat"])
-
-    # 调试：看切段和迭代
-    out = lsc.segmented_linear_regression(x, y, angle_diff_deg=10,
-                                    mse_threshold=1e-5, debug=True)
-    print("converged:", out["converged"],
-        "阈值:", out["angle_diff_threshold_deg"],
-        "轮数:", out["n_iterations"],
-        "段数:", len(out["segments"]))
-    for f in out["segments"]:
-        print(f"  [{f['start']:>2},{f['end']:>2}] 点数={f['n_points']:>2} "
-            f"角度={f['angle_deg']:.2f}°")
-    embed()
+    # rng = np.random.default_rng(0)
+    # x = np.linspace(0, np.pi / 2, 60)
+    # y = np.sin(x) + rng.normal(0, 0.002, x.size)
+    # lsc = LinearSimCurve(x,y)
+    # # 日常使用：只要 y_hat 和 mse
+    # out = lsc.segmented_linear_regression(x, y, angle_diff_deg=10, mse_threshold=1e-5)
+    # print("mse:", out["mse"])
+    # # plt.plot(x, out["y_hat"])
+    # # 调试：看切段和迭代
+    # out = lsc.segmented_linear_regression(x, y, angle_diff_deg=10,mse_threshold=1e-5, debug=True)
+    # print("converged:", out["converged"],
+    #     "阈值:", out["angle_diff_threshold_deg"],
+    #     "轮数:", out["n_iterations"],
+    #     "段数:", len(out["segments"]))
+    # for f in out["segments"]:
+    #     print(f"  [{f['start']:>2},{f['end']:>2}] 点数={f['n_points']:>2} "
+    #         f"角度={f['angle_deg']:.2f}°")
+    
+    seriesAngles2()
+    
+    # embed()
+    
 
 

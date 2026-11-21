@@ -2,6 +2,9 @@ import pandas as pd
 import numpy as np
 import weakref
 import torch
+import torch.nn.functional as F
+
+import matplotlib.pyplot as plt
 
 class RegHook:
     """查看神经网络 model 运行时的输入输出数据, 或查看参数和梯度。
@@ -55,9 +58,11 @@ class RegHook:
             # 根模块 name 为空字符串，退化为旧格式
             key_base = name if name else f"{name_prefix}_{idx}_{cls_name}"
 
-            self.handles.append(
-                layer.register_forward_hook(self._make_hook(key_base))
-            )
+            if self.inout in ("in", "both"):
+                self.handles.append(layer.register_forward_pre_hook(self._make_pre_hook(key_base)))
+            if self.inout in ("out", "both"):
+                self.handles.append(layer.register_forward_hook(self._make_post_hook(key_base)))
+            # self.handles.append(layer.register_forward_hook(self._make_hook(key_base)) )
     # ---- hook 相关 ----
     def _make_hook(self, key_base):
         ref = weakref.ref(self)
@@ -69,6 +74,22 @@ class RegHook:
                 obj.intermediate[f"{key_base}_in"] = obj._pack(inp)
             if obj.inout in ("out", "both"):
                 obj.intermediate[f"{key_base}_out"] = obj._pack(out)
+        return hook
+    def _make_pre_hook(self, key_base):
+        ref = weakref.ref(self)
+        def hook(module, inp):
+            obj = ref()
+            if obj is None or obj._closed:
+                return
+            obj.intermediate[f"{key_base}_in"] = obj._pack(inp)
+        return hook
+    def _make_post_hook(self, key_base):
+        ref = weakref.ref(self)
+        def hook(module, inp, out):
+            obj = ref()
+            if obj is None or obj._closed:
+                return
+            obj.intermediate[f"{key_base}_out"] = obj._pack(out)
         return hook
 
     def _pack(self, out):
@@ -149,8 +170,213 @@ class RegHook:
                 "shape": tuple(p.shape),
             }
         return info
+    @staticmethod
+    def get_attn_man(mha, x):
+        """
+        mha: nn.MultiheadAttention (batch_first=True) # model1.encoder.layers[i].self_attn
+        x  : [B, L, E]  #为了获取正确的输入, 需要使用RegHook来获取真实的输入。
+        返回每头的 Q, K, V, 注意力权重
+        """
+        B, L, E = x.shape
+        H  = mha.num_heads
+        Dh = E // H
+        assert E == mha.embed_dim
 
+        # 1) 取出合并的 QKV 权重和 bias
+        W = mha.in_proj_weight          # [3E, E]
+        b = mha.in_proj_bias            # [3E]
+        Wq, Wk, Wv = W.chunk(3, dim=0)  # 各 [E, E]
+        bq, bk, bv = b.chunk(3, dim=0)  # 各 [E]
 
+        # 2) 线性投影
+        q = F.linear(x, Wq, bq)         # [B, L, E]
+        k = F.linear(x, Wk, bk)
+        v = F.linear(x, Wv, bv)
+
+        # 3) 拆头
+        def reshape(t):
+            return t.view(B, L, H, Dh).transpose(1, 2)   # [B, H, L, Dh]
+
+        q_h, k_h, v_h = reshape(q), reshape(k), reshape(v)
+
+        # 4) 每头注意力
+        scale  = Dh ** 0.5
+        scores = (q_h @ k_h.transpose(-2, -1)) / scale   # [B, H, L, L]
+        attn   = scores.softmax(dim=-1)                  # [B, H, L, L]
+        return q_h, k_h, v_h, attn
+    @staticmethod
+    def get_attn_sys(rh=None, model=None,layers=None, *, x=None, 
+                    average_attn_weights=False,
+                    key_padding_mask=None,
+                    attn_mask=None,
+                    return_output=False,
+                    preserve_train_state=True):
+        """提取 Transformer 每层注意力权重。
+        ── 用法 A(推荐, 从已有 RegHook 提取，不重复 forward)──
+            targets = [f"encoder.layers.{i}.self_attn" for i in range(model.encoder.num_layers)]
+            with RegHook(model, layers=targets, inout="in", to_cpu=False) as rh:
+                model(x)
+                attn = RegHook.get_attn_sys(rh, model=model)
+            # attn = {"encoder.layers.0.self_attn": [B,H,L,L], ...}
+
+        ── 用法 B(便捷, 内部用 RegHook 跑一次 forward) ──
+            attn = RegHook.get_attn_sys(model=model1, x=x,layers="encoder.layers.0.self_attn")
+        Args:
+            rh:  RegHook 实例, forward 已运行, inout 需包含 'in',
+                且 layers 覆盖所有需要的 self_attn / multihead_attn。
+                提供后 x 被忽略，不再重跑 forward。
+            model: 模型对象（两个用法都必传，用于取 mha 模块引用）。
+            x:   model 的输入（仅用法 B 使用）。
+            layers: str/list/tuple/set/None, 仅筛选层,语义同 RegHook。
+            average_attn_weights: False → [B,H,L,L]; True → [B,L,L]。
+            key_padding_mask: 透传给 mha。
+            return_output: True 时返回 (attn_out, attn_w)，否则仅返回 attn_w。
+            preserve_train_state: 用法 B 下是否恢复 model 的 train 状态。
+
+        Returns:
+            dict: {层名: attn_w} 或 {层名: (attn_out, attn_w)}
+        """
+        if model is None:
+            raise ValueError("model 必传")
+        if rh is None and x is None:
+            raise ValueError("必须提供 rh, 或提供 x(内部跑 forward)")
+
+        # 1) 候选 attention 模块
+        candidates = []
+        encd = getattr(model, "encoder", None)
+        if encd is not None:
+            for i, layer in enumerate(encd.layers):
+                candidates.append((f"encoder.layers.{i}.self_attn",layer.self_attn, "self"))
+        decd = getattr(model, "decoder", None)
+        if decd is not None:
+            for i, layer in enumerate(decd.layers):
+                candidates.append((f"decoder.layers.{i}.self_attn",layer.self_attn, "self"))
+                if hasattr(layer, "multihead_attn"):
+                    candidates.append((f"decoder.layers.{i}.multihead_attn",layer.multihead_attn, "cross"))
+
+        # 2) 层筛选
+        if layers is not None:
+            if isinstance(layers, str):
+                target = {layers}
+            elif isinstance(layers, (list, tuple, set)):
+                target = set(layers)
+            else:
+                raise TypeError("layers must be str/list/tuple/set/None")
+
+            def _pick(name):
+                return any(name == t or name.startswith(t + ".")
+                        for t in target)
+            candidates = [c for c in candidates if _pick(c[0])]
+
+        if not candidates:
+            return {}
+
+        # 3) 准备 rh（数据源）
+        if rh is None:
+            # 用法 B：内部用 RegHook 抓一次
+            target_layers = [n for n, _, _ in candidates]
+            was_training = model.training
+            try:
+                with RegHook(model, layers=target_layers, inout="in",
+                            to_cpu=False) as _rh:
+                    with torch.no_grad():
+                        model.eval()      # 避免 forward 阶段 dropout 污染
+                        _ = model(x)
+            finally:
+                if preserve_train_state:
+                    model.train(was_training)
+            rh = _rh
+        else:
+            # 用法 A：检查 rh 是否覆盖了所有候选层
+            missing = [n for n, _, _ in candidates
+                    if f"{n}_in" not in rh.intermediate]
+            if missing:
+                raise KeyError(
+                    f"rh.intermediate 缺少以下层的输入: {missing}。"
+                    f"请确保创建 RegHook 时 inout='in' 或 'both'，"
+                    f"且 layers 覆盖这些层。"
+                )
+
+        # 4) 从 rh 提取输入，算注意力
+        def _run(m, q, k=None, v=None):
+            k = q if k is None else k
+            v = k if v is None else v
+
+            # 设备对齐：rh 里可能是 CPU 数据（to_cpu=True 时）
+            dev = m.in_proj_weight.device
+            orig_dev = q.device
+            q = q.to(dev) if q.device != dev else q
+            k = k.to(dev) if k.device != dev else k
+            v = v.to(dev) if v.device != dev else v
+
+            # 临时 eval，避免 attention dropout 污染结果
+            was_train = m.training
+            m.eval()
+            try:
+                with torch.no_grad():
+                    out, w = m(
+                        q, k, v,
+                        need_weights=True,
+                        average_attn_weights=average_attn_weights,
+                        key_padding_mask=key_padding_mask,
+                        attn_mask=attn_mask,        # <--- 新增这一行
+                    )
+            finally:
+                m.train(was_train)
+
+            if orig_dev != dev:
+                out = out.to(orig_dev)
+                w = w.to(orig_dev)
+            return (out, w) if return_output else w
+
+        rst = {}
+        for name, m, kind in candidates:
+            inp = rh.intermediate[f"{name}_in"]
+            if kind == "self":
+                q = inp[0]
+                rst[name] = _run(m, q)
+            else:                    # cross: inp = (q, memory, ...)
+                q, mem = inp[0], inp[1]
+                rst[name] = _run(m, q, k=mem, v=mem)
+        return rst
+    @staticmethod
+    def get_attn_one(mha, x, *, average_attn_weights=False,
+                    key_padding_mask=None, return_output=False):
+        """对单个 MultiheadAttention 用给定输入算注意力权重。
+        使用：
+        w = RegHook.get_attn_one(
+            model1.encoder.layers[0].self_attn,
+            rh2.intermediate['encoder.layers.0.self_attn_in'][0],
+            )
+        """
+        was_train = mha.training
+        mha.eval()
+        try:
+            with torch.no_grad():
+                out, w = mha(
+                    x, x, x,
+                    need_weights=True,
+                    average_attn_weights=average_attn_weights,
+                    key_padding_mask=key_padding_mask,
+                )
+        finally:
+            mha.train(was_train)
+        return (out, w) if return_output else w
+    @staticmethod
+    def plot_attn(attn, batch_idx=0, title=""):
+        """绘制第batch_idx 批次的 的注意力权重
+        attn: 需要显示的注意力权重[batch,num_headers,L,L]
+        batch_idx: 默认为第1批次
+        """
+        attn = attn.detach().cpu()
+        H = attn.size(1)
+        fig, axes = plt.subplots(1, H, figsize=(4 * H, 4))
+        if H == 1: axes = [axes]
+        for h in range(H):
+            im = axes[h].imshow(attn[batch_idx, h], aspect="auto", cmap="viridis")
+            axes[h].set_title(f"head {h}")
+            axes[h].set_xlabel("key pos"); axes[h].set_ylabel("query pos")
+        fig.suptitle(title); fig.colorbar(im, ax=axes, fraction=0.02); plt.show()
 class LinearSimCurve():
     def __init__(self,x,y):
         self.x = x
