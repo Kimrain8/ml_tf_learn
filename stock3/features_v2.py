@@ -5,25 +5,29 @@ import pandas as pd
 import scipy.stats as stats
 from config import OUT_DIR
 
+# 个股时序特征 (11维)
 SEQ_COLS = ["pct_chg", "amplitude", "log_volume", "log_amount", "turnover",
             "volume_ratio", "main_inflow_ratio", "open_to_close", 
             "high_to_close", "low_to_close", "gap_today"]
-
+# 行业时序特征 (3维：行业日收益、行业日波动、行业换手)
 IND_SEQ_COLS = ["ind_pct", "ind_amp", "ind_turnover"]
-
+# 表格截面特征 (在原有基础上增加周期动态特征，28维)
 TAB_COLS = ["chg_5d", "chg_10d", "chg_20d", "chg_60d", "chg_52w", "chg_ytd",
             "log_float_mv", "log_total_mv", "pb", "pe_ttm", "pe_dynamic", "pe_static",
             "main_inflow_ratio", "main_in_5d_ratio", "main_out_5d_ratio", "listing_days",
             "prev_gap", "prev_ret", "prev_amp",
             "mkt_pct", "prev_mkt_pct", "mkt_up_ratio", "prev_mkt_up_ratio",
             "mkt_amp", "mkt_limit_up", "mkt_limit_down", "ind_pct_excess",
-            "ma20_distance"]
-
+            "ma20_distance"] # 新增：动态振幅（距离20日均线的偏离度）
+# 7维
 MKT_COLS = ["mkt_pct", "prev_mkt_pct", "mkt_up_ratio", "prev_mkt_up_ratio",
             "mkt_amp", "mkt_limit_up", "mkt_limit_down"]
+# 行业ID
 CAT_COLS = ["sw_l3_id"]
 SEQ_LEN = 20
 
+# 对量，金额，流通金额，总金额 做ln(1+x)处理；收盘对开盘增长率，最高价对收盘增长率，收盘对最低价增长率，
+# 开盘对昨收盘增长率，主力净流入对总市值比例，5日净流入对总市值比例，5日净流出对总市值比例
 def _add_base_features(df):
     f = df.copy()
     f["log_volume"] = np.log1p(f["volume"])

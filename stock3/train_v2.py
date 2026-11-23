@@ -46,7 +46,8 @@ def prepare_data():
             (X_seq, torch.float32), (X_ind_seq, torch.float32), 
             (X_tab, torch.float32), (X_cat, torch.long), (y_gap_excess, torch.float32)]]
     
-    return get_split(dates[:train_end]), get_split(dates[train_end:val_end]), get_split(dates[val_end:]), meta_train, dates
+    latest_date = str(meta["trade_date"].max()).split()[0].replace("-", "")
+    return get_split(dates[:train_end]), get_split(dates[train_end:val_end]), get_split(dates[val_end:]), meta_train, dates, latest_date
 
 def train_epoch(model, dl, crit, opt, dev):
     model.train(); tot = 0
@@ -70,7 +71,6 @@ def evaluate(model, dl, crit, dev, eval_meta=None):
             preds.append(mu.cpu().numpy().ravel())
             
     pred_all = np.concatenate(preds)
-    loss_avg = tot / len(dl.dataset)
     ic = 0
     if eval_meta is not None:
         eval_meta = eval_meta.copy()
@@ -82,25 +82,26 @@ def evaluate(model, dl, crit, dev, eval_meta=None):
                 ic_val, _ = spearmanr(day_data["pred"], day_data["y_gap_excess"])
                 if not np.isnan(ic_val): ic_list.append(ic_val)
         if ic_list: ic = np.mean(ic_list)
-    return loss_avg, ic
+    return tot / len(dl.dataset), ic
 
 def main():
     set_seed(42)
     dev = torch.device("cpu")
-    tr, va, te, meta_train, dates = prepare_data()
+    tr, va, te, meta_train, dates, latest_date = prepare_data()
     
     tr_dl = DataLoader(TensorDataset(*tr), batch_size=2048, shuffle=True)
     va_dl = DataLoader(TensorDataset(*va), batch_size=2048, shuffle=False)
     te_dl = DataLoader(TensorDataset(*te), batch_size=2048, shuffle=False)
 
-    # 注意这里换了模型，并且设置了新的输入维度
     model = LightweightFusionV2(seq_dim=11, ind_seq_dim=3, tab_dim=28, cat_vocab_size=400).to(dev)
     crit = MultiTaskLoss()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-2)
 
-    print("\n开始训练 (双 LSTM 捕捉趋势与周期)...")
+    print(f"\n开始训练 LSTM (按日保存，本次运行标记为 {latest_date})...")
     best_val_ic = -1.0
-    model_path = os.path.join(OUT_DIR, "best_model_v2.pth")
+    
+    # ★ 模型保存在 m3_features_v2 目录下，带上日期
+    model_path = os.path.join(OUT_DIR, "m3_features_v2", f"lstm_{latest_date}.pth")
     
     va_meta = meta_train[meta_train["trade_date"].isin(dates[int(len(dates)*0.6):int(len(dates)*0.8)])]
 
@@ -115,7 +116,7 @@ def main():
         if va_ic > best_val_ic:
             best_val_ic = va_ic
             torch.save(model.state_dict(), model_path)
-            print(f"   -> 发现更好的 IC ({best_val_ic:.4f})，已保存模型 V2")
+            print(f"   -> 发现更好的 IC ({best_val_ic:.4f})，已保存模型至: {model_path}")
 
     print("\n测试集评估：")
     model.load_state_dict(torch.load(model_path, map_location=dev))
