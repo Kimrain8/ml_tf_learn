@@ -81,7 +81,7 @@ def load_fact_daily() -> pd.DataFrame:
     db = MySQLHelper(db='jhd')
     enddate = pd.Timestamp.now().date()
     startdate = enddate + pd.Timedelta(days=-70)
-    sql = f"""select qh.symbol,qh.trade_date, tsh.close_price,qq.open_price,qq.high,qq.low
+    """sql = fselect qh.symbol,qh.trade_date, tsh.close_price,qq.open_price,qq.high,qq.low
     ,tsh.pre_close,LAG(tsh.close_price, 1) OVER (PARTITION BY tsh.ts_code ORDER BY tsh.trade_date) AS prev_raw_close
     ,qh.pct_chg, qh.change_amount
     , qh.zdf_d5, qh.zdf_d10, qh.zdf_d20, qh.zdf_d60, qh.zdf_w52, qh.zdf_y
@@ -92,6 +92,17 @@ def load_fact_daily() -> pd.DataFrame:
     join my_choice_stock AS mcs on mcs.symbol = qh.symbol
     join ts_stock_daily_his AS tsh on tsh.ts_code =  mcs.ts_code and qh.trade_date = tsh.trade_date
     where qh.trade_date between '{startdate.strftime("%Y-%m-%d")}' and '{enddate.strftime("%Y-%m-%d")}' """
+    sql = f"""select qh.symbol,qh.trade_date, qq.zxj as close_price,qq.open_price,qq.high,qq.low
+    ,qq.pre_close ,LAG(qq.zxj, 1) OVER (PARTITION BY qq.symbol ORDER BY qq.trade_date) AS prev_raw_close
+    ,qh.pct_chg, qh.change_amount
+    , qh.zdf_d5, qh.zdf_d10, qh.zdf_d20, qh.zdf_d60, qh.zdf_w52, qh.zdf_y
+    , qh.zljlr,qh.zllr_d5,qh.zllc_d5
+    , qh.hsl,qh.lb, qh.zf, qh.vol, qh.amount
+    , qh.ltsz, qh.zsz, qh.pn,qq.pe_dyna,qq.pe_ttm,qq.pe_static
+    from qq_hsj AS qh left join qq_qt AS qq on qq.trade_date = qh.trade_date and qq.symbol = qh.symbol
+    where qh.trade_date between '{startdate.strftime("%Y-%m-%d")}' and '{enddate.strftime("%Y-%m-%d")}' 
+    and qq.vol > 0 """
+    
     df = db.qry2df(sql=sql)
     # embed()
     df.rename(columns={"close_price":"close","open_price":"open",

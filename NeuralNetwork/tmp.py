@@ -6,13 +6,12 @@ matplotlib.use('QtAgg')   # 或 'TkAgg'/'Qt5Agg' 需要安装PyQt5或PyQt6 / 'Ma
 import matplotlib.pyplot as plt
 from utils.MyTools import MyTools as mt
 from utils.MyTf import RegHook
+from utils.dbManager import MySQLHelper
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
-
 
 
 
@@ -25,3 +24,4 @@ if __name__ == "__main__":
     
     
     embed()
+
